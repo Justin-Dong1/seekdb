@@ -15,7 +15,11 @@
 #include <limits>
 #include <new>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
 
 #include "lib/oblog/ob_log.h"
 #include "share/ob_errno.h"
@@ -26,6 +30,37 @@ namespace sql
 {
 namespace
 {
+#ifdef _WIN32
+using ObNativeFileStat = struct _stat64;
+int ob_parquet_native_open(const char *path) { return _open(path, _O_RDONLY | _O_BINARY); }
+int ob_parquet_native_close(const int fd) { return _close(fd); }
+int ob_parquet_native_fstat(const int fd, ObNativeFileStat *file_stat) { return _fstat64(fd, file_stat); }
+int64_t ob_parquet_native_pread(const int fd, void *buffer, const size_t size, const int64_t offset)
+{
+  return -1 == _lseeki64(fd, offset, SEEK_SET)
+       ? -1 : static_cast<int64_t>(_read(fd, buffer, static_cast<unsigned int>(size)));
+}
+int64_t ob_parquet_native_mtime_ns(const ObNativeFileStat &file_stat)
+{ return static_cast<int64_t>(file_stat.st_mtime) * 1000000000L; }
+#else
+using ObNativeFileStat = struct stat;
+int ob_parquet_native_open(const char *path) { return ::open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW); }
+int ob_parquet_native_close(const int fd) { return ::close(fd); }
+int ob_parquet_native_fstat(const int fd, ObNativeFileStat *file_stat) { return fstat(fd, file_stat); }
+int64_t ob_parquet_native_pread(const int fd, void *buffer, const size_t size, const int64_t offset)
+{ return pread(fd, buffer, size, offset); }
+int64_t ob_parquet_native_mtime_ns(const ObNativeFileStat &file_stat)
+{
+#if defined(__APPLE__)
+  return static_cast<int64_t>(file_stat.st_mtimespec.tv_sec) * 1000000000L
+       + static_cast<int64_t>(file_stat.st_mtimespec.tv_nsec);
+#else
+  return static_cast<int64_t>(file_stat.st_mtim.tv_sec) * 1000000000L
+       + static_cast<int64_t>(file_stat.st_mtim.tv_nsec);
+#endif
+}
+#endif
+
 enum CompactType : uint8_t
 {
   CT_STOP = 0, CT_TRUE = 1, CT_FALSE = 2, CT_BYTE = 3, CT_I16 = 4,
@@ -486,7 +521,7 @@ int pread_all(const int fd, const int64_t offset, uint8_t *data, const size_t si
   int ret = OB_SUCCESS;
   size_t done = 0;
   while (OB_SUCC(ret) && done < size) {
-    const ssize_t count = pread(fd, data + done, size - done, offset + done);
+    const int64_t count = ob_parquet_native_pread(fd, data + done, size - done, offset + done);
     if (count > 0) done += static_cast<size_t>(count);
     else ret = OB_IO_ERROR;
   }
@@ -643,20 +678,19 @@ int open_verified(const std::string &path, const uint64_t expected_device,
                   const int64_t expected_mtime_ns, int &fd)
 {
   int ret = OB_SUCCESS;
-  fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-  struct stat st;
-  if (fd < 0 || 0 != fstat(fd, &st) || !S_ISREG(st.st_mode)) {
-    if (fd >= 0) ::close(fd);
+  fd = ob_parquet_native_open(path.c_str());
+  ObNativeFileStat st;
+  if (fd < 0 || 0 != ob_parquet_native_fstat(fd, &st) || !S_ISREG(st.st_mode)) {
+    if (fd >= 0) ob_parquet_native_close(fd);
     fd = -1;
     ret = OB_FILE_NOT_OPENED;
   } else {
-    const int64_t mtime_ns = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000L
-                           + static_cast<int64_t>(st.st_mtim.tv_nsec);
+    const int64_t mtime_ns = ob_parquet_native_mtime_ns(st);
     if ((0 != expected_device && static_cast<uint64_t>(st.st_dev) != expected_device)
         || (0 != expected_inode && static_cast<uint64_t>(st.st_ino) != expected_inode)
         || (expected_size >= 0 && static_cast<int64_t>(st.st_size) != expected_size)
         || (expected_mtime_ns >= 0 && mtime_ns != expected_mtime_ns)) {
-      ::close(fd); fd = -1; ret = OB_SCHEMA_EAGAIN;
+      ob_parquet_native_close(fd); fd = -1; ret = OB_SCHEMA_EAGAIN;
     }
   }
   return ret;
@@ -1070,7 +1104,7 @@ public:
   ~Impl() { close(); }
   void close()
   {
-    if (fd_ >= 0) ::close(fd_);
+    if (fd_ >= 0) ob_parquet_native_close(fd_);
     fd_ = -1;
     file_size_ = 0;
     meta_ = FileMeta();
@@ -1305,11 +1339,11 @@ int ObParquetReader::infer_schema(const std::string &path,
 {
   int ret = OB_SUCCESS;
   int fd = -1;
-  struct stat st;
+  ObNativeFileStat st;
   FileMeta meta;
   if (OB_FAIL(open_verified(path, 0, 0, -1, -1, fd))) {
     LOG_WARN("failed to open parquet file", K(ret));
-  } else if (0 != fstat(fd, &st)) {
+  } else if (0 != ob_parquet_native_fstat(fd, &st)) {
     ret = OB_IO_ERROR;
   } else if (OB_FAIL(read_file_metadata(fd, st.st_size, meta))) {
     LOG_WARN("failed to read parquet metadata", K(ret));
@@ -1318,7 +1352,7 @@ int ObParquetReader::infer_schema(const std::string &path,
   } else {
     row_count = meta.num_rows_;
   }
-  if (fd >= 0) ::close(fd);
+  if (fd >= 0) ob_parquet_native_close(fd);
   return ret;
 }
 
@@ -1346,8 +1380,8 @@ int ObParquetReader::open(const std::string &path,
                               expected_modified_time_ns, impl_->fd_))) {
       LOG_WARN("failed to open verified parquet file", K(ret));
     } else {
-      struct stat st;
-      if (0 != fstat(impl_->fd_, &st)) {
+      ObNativeFileStat st;
+      if (0 != ob_parquet_native_fstat(impl_->fd_, &st)) {
         ret = OB_IO_ERROR;
       } else {
         impl_->file_size_ = st.st_size;

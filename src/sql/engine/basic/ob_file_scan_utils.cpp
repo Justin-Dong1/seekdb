@@ -31,15 +31,16 @@
 #include <mutex>
 #include <unordered_map>
 #include <fcntl.h>
-#include <unistd.h>
 #include <sys/stat.h>
 
 #ifdef _WIN32
 #include <direct.h>
+#include <io.h>
 #include <stdlib.h>
 #else
 #include <limits.h>
 #include <stdlib.h>
+#include <unistd.h>
 #endif
 
 #include "common/json_type/ob_json_base.h"
@@ -57,6 +58,33 @@ namespace sql
 namespace
 {
 
+#ifdef _WIN32
+using ObNativeFileStat = struct _stat64;
+int ob_native_open(const char *path) { return _open(path, _O_RDONLY | _O_BINARY); }
+int ob_native_close(const int fd) { return _close(fd); }
+int64_t ob_native_read(const int fd, void *buffer, const size_t size)
+{ return static_cast<int64_t>(_read(fd, buffer, static_cast<unsigned int>(size))); }
+int ob_native_fstat(const int fd, ObNativeFileStat *file_stat) { return _fstat64(fd, file_stat); }
+int64_t ob_native_mtime_ns(const ObNativeFileStat &file_stat)
+{ return static_cast<int64_t>(file_stat.st_mtime) * 1000000000L; }
+#else
+using ObNativeFileStat = struct stat;
+int ob_native_open(const char *path) { return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW); }
+int ob_native_close(const int fd) { return close(fd); }
+int64_t ob_native_read(const int fd, void *buffer, const size_t size) { return read(fd, buffer, size); }
+int ob_native_fstat(const int fd, ObNativeFileStat *file_stat) { return fstat(fd, file_stat); }
+int64_t ob_native_mtime_ns(const ObNativeFileStat &file_stat)
+{
+#if defined(__APPLE__)
+  return static_cast<int64_t>(file_stat.st_mtimespec.tv_sec) * 1000000000L
+       + static_cast<int64_t>(file_stat.st_mtimespec.tv_nsec);
+#else
+  return static_cast<int64_t>(file_stat.st_mtim.tv_sec) * 1000000000L
+       + static_cast<int64_t>(file_stat.st_mtim.tv_nsec);
+#endif
+}
+#endif
+
 class SafeFileStreamBuf : public std::streambuf
 {
 public:
@@ -64,7 +92,7 @@ public:
   virtual ~SafeFileStreamBuf()
   {
     if (fd_ >= 0) {
-      close(fd_);
+      ob_native_close(fd_);
     }
   }
 protected:
@@ -74,7 +102,7 @@ protected:
     if (gptr() < egptr()) {
       result = traits_type::to_int_type(*gptr());
     } else {
-      const ssize_t read_size = read(fd_, buffer_, sizeof(buffer_));
+      const int64_t read_size = ob_native_read(fd_, buffer_, sizeof(buffer_));
       if (read_size > 0) {
         setg(buffer_, buffer_, buffer_ + read_size);
         result = traits_type::to_int_type(*gptr());
@@ -96,12 +124,12 @@ int open_safe_input_stream(const std::string &path,
                            int64_t *opened_mtime_ns = nullptr)
 {
   int ret = OB_SUCCESS;
-  const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-  struct stat file_stat;
+  const int fd = ob_native_open(path.c_str());
+  ObNativeFileStat file_stat;
   if (fd < 0) {
     ret = OB_FILE_NOT_OPENED;
-  } else if (0 != fstat(fd, &file_stat) || !S_ISREG(file_stat.st_mode)) {
-    close(fd);
+  } else if (0 != ob_native_fstat(fd, &file_stat) || !S_ISREG(file_stat.st_mode)) {
+    ob_native_close(fd);
     ret = OB_INVALID_DATA;
   } else {
     if (nullptr != opened_device) {
@@ -114,17 +142,11 @@ int open_safe_input_stream(const std::string &path,
       *opened_size = static_cast<int64_t>(file_stat.st_size);
     }
     if (nullptr != opened_mtime_ns) {
-#if defined(__APPLE__)
-      *opened_mtime_ns = static_cast<int64_t>(file_stat.st_mtimespec.tv_sec) * 1000000000L
-                       + static_cast<int64_t>(file_stat.st_mtimespec.tv_nsec);
-#else
-      *opened_mtime_ns = static_cast<int64_t>(file_stat.st_mtim.tv_sec) * 1000000000L
-                       + static_cast<int64_t>(file_stat.st_mtim.tv_nsec);
-#endif
+      *opened_mtime_ns = ob_native_mtime_ns(file_stat);
     }
     buffer.reset(new (std::nothrow) SafeFileStreamBuf(fd));
     if (!buffer) {
-      close(fd);
+      ob_native_close(fd);
       ret = OB_ALLOCATE_MEMORY_FAILED;
     } else {
       stream.reset(new (std::nothrow) std::istream(buffer.get()));

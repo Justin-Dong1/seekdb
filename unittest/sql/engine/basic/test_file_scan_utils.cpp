@@ -19,7 +19,7 @@
 #include <fstream>
 #include <unistd.h>
 
-#include "share/ob_errno.h"
+#include "lib/ob_errno.h"
 #include "sql/engine/basic/ob_file_scan_utils.h"
 
 namespace oceanbase
@@ -457,9 +457,3 @@ TEST(TestFileScanUtils, parquet_impala_plain_snappy_and_dictionary)
 
 } // namespace sql
 } // namespace oceanbase
-
-int main(int argc, char **argv)
-{
-  ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
-}

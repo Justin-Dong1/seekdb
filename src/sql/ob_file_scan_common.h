@@ -31,6 +31,7 @@ enum class ObFileTableKind : int32_t
   SCAN = 0,
   LIST,
   SCHEMA,
+  GLOB,
   INVALID
 };
 
@@ -75,7 +76,8 @@ struct ObFileTableColumnDef
 struct ObFileTableDef
 {
   ObFileTableDef()
-    : kind_(ObFileTableKind::INVALID), canonical_path_(), secure_file_priv_(), format_(ObFileFormat::INVALID),
+    : kind_(ObFileTableKind::INVALID), canonical_path_(), secure_file_priv_(), glob_pattern_(),
+      format_(ObFileFormat::INVALID),
       columns_(), source_columns_(), estimated_rows_(0), device_(0), inode_(0),
       file_size_(0), modified_time_ns_(0)
   {}
@@ -83,6 +85,7 @@ struct ObFileTableDef
   ObFileTableKind kind_;
   common::ObString canonical_path_;
   common::ObString secure_file_priv_;
+  common::ObString glob_pattern_;
   ObFileFormat format_;
   common::ObSEArray<ObFileTableColumnDef, 16> columns_;
   common::ObSEArray<ObFileTableColumnDef, 16> source_columns_;
@@ -91,7 +94,7 @@ struct ObFileTableDef
   uint64_t inode_;
   int64_t file_size_;
   int64_t modified_time_ns_;
-  TO_STRING_KV(K_(kind), K_(canonical_path), K_(secure_file_priv), K_(format), K_(columns), K_(source_columns),
+  TO_STRING_KV(K_(kind), K_(canonical_path), K_(secure_file_priv), K_(glob_pattern), K_(format), K_(columns), K_(source_columns),
                K_(estimated_rows), K_(device), K_(inode), K_(file_size), K_(modified_time_ns));
 };
 

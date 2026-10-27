@@ -289,7 +289,7 @@ END_P SET_VAR DELIMITER
         FOUND FORK FREEZE FREQUENCY FUNCTION FOLLOWING FLASHBACK FULL FRAGMENTATION FROZEN FILE_ID FILTER
         FIELD_OPTIONALLY_ENCLOSED_BY FIELD_DELIMITER FIELD_ENCLOSED_BY FILE_EXTENSION
 
-        GENERAL GEOMETRY GEOMCOLLECTION GEOMETRYCOLLECTION GET_FORMAT GLOBAL GRANTS GROUP_CONCAT GROUPING
+        GENERAL GEOMETRY GEOMCOLLECTION GEOMETRYCOLLECTION GET_FORMAT GLOBAL GLOB GRANTS GROUP_CONCAT GROUPING
         GLOBAL_ALIAS
 
         HASH HEAP HELP HISTOGRAM HOUR HIDDEN HYBRID HYBRID_HIST HYBRID_SEARCH
@@ -332,7 +332,7 @@ END_P SET_VAR DELIMITER
 
         QUANTIFIER_TABLE QUARTER QUERY QUEUE_TIME QUICK
 
-        RECOVER REDUNDANT REFRESH RELAY RELAYLOG RELAY_LOG_FILE RELAY_LOG_POS RELAY_THREAD RELOAD REMOVE
+        READ_CSV READ_JSON READ_NDJSON READ_PARQUET RECOVER REDUNDANT REFRESH RELAY RELAYLOG RELAY_LOG_FILE RELAY_LOG_POS RELAY_THREAD RELOAD REMOVE
         REPEATABLE RESET RESPECT RESTART RESTORE RESUME RETURNED_SQLSTATE RETURNS RETURNING REVERSE
         REWRITE ROLLBACK ROLLUP ROUTINE ROW ROWID ROW_COUNT ROW_FORMAT ROWS RTREE
         RUN RECYCLEBIN REPLICATION ROTATE ROW_NUMBER RUDUNDANT RECURSIVE RANDOM REDO_TRANSPORT_OPTIONS
@@ -511,7 +511,8 @@ END_P SET_VAR DELIMITER
 %type <node> column_list_with_boost with_param_column_ref
 %type <node> es_sql_opt
 %type <node> hybrid_search_expr hybrid_search_param
-%type <node> file_scan_expr file_list_expr file_schema_expr
+%type <node> file_scan_expr file_list_expr file_schema_expr read_file_expr read_file_function glob_expr
+%type <node> opt_file_scan_options file_scan_option_list file_scan_option file_scan_option_name
 %type <node> vector_similarity_expr vector_similarity_metric
 %type <node> algorithm_opt lock_opt
 %type <node> flush_privileges_stmt opt_flush_privileges_scope
@@ -10861,6 +10862,14 @@ tbl_name
 {
   $$ = $1;
 }
+| read_file_expr
+{
+  $$ = $1;
+}
+| glob_expr
+{
+  $$ = $1;
+}
 ;
 
 tbl_name:
@@ -17493,7 +17502,7 @@ literal
 ;
 
 file_scan_expr:
-FILE_SCAN '(' literal ')'
+FILE_SCAN '(' literal ')' %prec LOWER_PARENS
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SCAN_TABLE, 3, $3, NULL, NULL);
 }
@@ -17505,7 +17514,7 @@ FILE_SCAN '(' literal ')'
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SCAN_TABLE, 3, $3, NULL, $6);
 }
-| FILE_SCAN '(' literal ',' literal ')'
+| FILE_SCAN '(' literal ',' literal ')' %prec LOWER_PARENS
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SCAN_TABLE, 3, $3, $5, NULL);
 }
@@ -17520,7 +17529,7 @@ FILE_SCAN '(' literal ')'
 ;
 
 file_list_expr:
-FILE_LIST '(' literal ')'
+FILE_LIST '(' literal ')' %prec LOWER_PARENS
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_LIST_TABLE, 2, $3, NULL);
 }
@@ -17535,7 +17544,7 @@ FILE_LIST '(' literal ')'
 ;
 
 file_schema_expr:
-FILE_SCHEMA '(' literal ')'
+FILE_SCHEMA '(' literal ')' %prec LOWER_PARENS
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SCHEMA_TABLE, 2, $3, NULL);
 }
@@ -17546,6 +17555,99 @@ FILE_SCHEMA '(' literal ')'
 | FILE_SCHEMA '(' literal ')' AS relation_name
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SCHEMA_TABLE, 2, $3, $6);
+}
+;
+
+read_file_expr:
+read_file_function '(' literal opt_file_scan_options ')' %prec LOWER_PARENS
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SCAN_TABLE, 4, $3, $1, NULL, $4);
+}
+| read_file_function '(' literal opt_file_scan_options ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SCAN_TABLE, 4, $3, $1, $6, $4);
+}
+| read_file_function '(' literal opt_file_scan_options ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SCAN_TABLE, 4, $3, $1, $7, $4);
+}
+;
+
+read_file_function:
+READ_CSV
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_VARCHAR);
+  $$->str_value_ = "csv";
+  $$->str_len_ = strlen("csv");
+}
+| READ_JSON
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_VARCHAR);
+  $$->str_value_ = "jsonl";
+  $$->str_len_ = strlen("jsonl");
+}
+| READ_NDJSON
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_VARCHAR);
+  $$->str_value_ = "jsonl";
+  $$->str_len_ = strlen("jsonl");
+}
+| READ_PARQUET
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_VARCHAR);
+  $$->str_value_ = "parquet";
+  $$->str_len_ = strlen("parquet");
+}
+;
+
+opt_file_scan_options:
+/* empty */
+{
+  $$ = NULL;
+}
+| ',' file_scan_option_list
+{
+  $$ = $2;
+}
+;
+
+file_scan_option_list:
+file_scan_option
+{
+  malloc_list_node($$, result->malloc_pool_, T_EXPR_LIST, 2, 1, $1);
+}
+| file_scan_option_list ',' file_scan_option
+{
+  push_back_list(result->malloc_pool_, result, $$, $1, $3);
+}
+;
+
+file_scan_option:
+file_scan_option_name COMP_EQ signed_literal
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_OP_EQ, 2, $1, $3);
+}
+;
+
+file_scan_option_name:
+relation_name
+{
+  $$ = $1;
+}
+;
+
+glob_expr:
+GLOB '(' literal ')' %prec LOWER_PARENS
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_LIST_TABLE, 3, $3, NULL, NULL);
+}
+| GLOB '(' literal ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_LIST_TABLE, 3, $3, $5, NULL);
+}
+| GLOB '(' literal ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_LIST_TABLE, 3, $3, $6, NULL);
 }
 ;
 
@@ -18254,6 +18356,11 @@ ACCOUNT
 |       FILE_SCAN
 |       FILE_LIST
 |       FILE_SCHEMA
+|       READ_CSV
+|       READ_JSON
+|       READ_NDJSON
+|       READ_PARQUET
+|       GLOB
 ;
 
 unreserved_keyword_special:

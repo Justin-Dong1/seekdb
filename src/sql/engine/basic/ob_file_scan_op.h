@@ -21,7 +21,7 @@ class ObFileScanSpec : public ObOpSpec
 public:
   ObFileScanSpec(common::ObIAllocator &alloc, const ObPhyOperatorType type)
     : ObOpSpec(alloc, type), kind_(static_cast<int32_t>(ObFileTableKind::INVALID)),
-      file_path_(), secure_file_priv_(), file_format_(static_cast<int32_t>(ObFileFormat::INVALID)),
+      file_path_(), secure_file_priv_(), glob_pattern_(), file_format_(static_cast<int32_t>(ObFileFormat::INVALID)),
       device_(0), inode_(0), file_size_(0), modified_time_ns_(0),
       file_column_names_(alloc), file_column_types_(alloc),
       source_column_names_(alloc), source_original_names_(alloc),
@@ -32,6 +32,7 @@ public:
   int32_t kind_;
   common::ObString file_path_;
   common::ObString secure_file_priv_;
+  common::ObString glob_pattern_;
   int32_t file_format_;
   uint64_t device_;
   uint64_t inode_;

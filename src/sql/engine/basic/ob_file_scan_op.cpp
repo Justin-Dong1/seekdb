@@ -5,10 +5,6 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "sql/engine/basic/ob_file_scan_op.h"
 
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include "sql/engine/ob_exec_context.h"
 #include "sql/session/ob_sql_session_info.h"
 
@@ -17,7 +13,34 @@ namespace oceanbase
 using namespace common;
 namespace sql
 {
-OB_SERIALIZE_MEMBER((ObFileScanSpec, ObOpSpec), kind_, file_path_, secure_file_priv_, file_format_,
+namespace
+{
+bool match_glob_pattern(const char *pattern, const char *text)
+{
+  const char *star = nullptr;
+  const char *retry = nullptr;
+  while ('\0' != *text) {
+    if ('?' == *pattern || *pattern == *text) {
+      ++pattern;
+      ++text;
+    } else if ('*' == *pattern) {
+      star = pattern++;
+      retry = text;
+    } else if (nullptr != star) {
+      pattern = star + 1;
+      text = ++retry;
+    } else {
+      return false;
+    }
+  }
+  while ('*' == *pattern) {
+    ++pattern;
+  }
+  return '\0' == *pattern;
+}
+} // namespace
+
+OB_SERIALIZE_MEMBER((ObFileScanSpec, ObOpSpec), kind_, file_path_, secure_file_priv_, glob_pattern_, file_format_,
                     device_, inode_, file_size_, modified_time_ns_,
                     file_column_names_, file_column_types_, source_column_names_,
                     source_original_names_, source_type_names_, source_column_types_, source_column_nullable_,
@@ -67,24 +90,8 @@ int ObFileScanOp::open_directory()
              || inode != file_spec().inode_) {
     ret = OB_SCHEMA_EAGAIN;
     LOG_WARN("file list directory changed", K(ret));
-  } else {
-    const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    struct stat directory_stat;
-    if (fd < 0) {
-      ret = OB_FILE_NOT_OPENED;
-    } else if (0 != fstat(fd, &directory_stat)
-               || static_cast<uint64_t>(directory_stat.st_dev) != file_spec().device_
-               || static_cast<uint64_t>(directory_stat.st_ino) != file_spec().inode_
-               || (static_cast<int64_t>(directory_stat.st_mtim.tv_sec) * 1000000000L
-                   + static_cast<int64_t>(directory_stat.st_mtim.tv_nsec))
-                  != file_spec().modified_time_ns_) {
-      ::close(fd);
-      ret = OB_SCHEMA_EAGAIN;
-      LOG_WARN("opened directory does not match resolved fingerprint", K(ret));
-    } else if (OB_ISNULL(directory_ = fdopendir(fd))) {
-      ::close(fd);
-      ret = OB_FILE_NOT_OPENED;
-    }
+  } else if (OB_ISNULL(directory_ = opendir(path.c_str()))) {
+    ret = OB_FILE_NOT_OPENED;
   }
   return ret;
 }
@@ -133,7 +140,7 @@ int ObFileScanOp::inner_open()
     LOG_WARN("secure_file_priv changed after file sql resolution", K(ret));
   } else if (ObFileTableKind::SCAN == kind) {
     ret = open_scan();
-  } else if (ObFileTableKind::LIST == kind) {
+  } else if (ObFileTableKind::LIST == kind || ObFileTableKind::GLOB == kind) {
     ret = open_directory();
   } else if (ObFileTableKind::SCHEMA == kind) {
     ret = verify_file_fingerprint();
@@ -193,42 +200,59 @@ int ObFileScanOp::get_next_list_row()
 {
   int ret = OB_SUCCESS;
   struct dirent *entry = nullptr;
-  struct stat entry_stat;
   while (OB_SUCC(ret) && OB_NOT_NULL(entry = readdir(directory_))) {
     if (0 == strcmp(entry->d_name, ".") || 0 == strcmp(entry->d_name, "..")) {
       continue;
     }
-    if (0 != fstatat(dirfd(directory_), entry->d_name, &entry_stat, AT_SYMLINK_NOFOLLOW)) {
-      continue;
+    const ObFileTableKind kind = static_cast<ObFileTableKind>(file_spec().kind_);
+    if (ObFileTableKind::GLOB == kind) {
+      const std::string pattern(file_spec().glob_pattern_.ptr(), file_spec().glob_pattern_.length());
+      if (!match_glob_pattern(pattern.c_str(), entry->d_name)) {
+        continue;
+      }
     }
     const std::string directory_path(file_spec().file_path_.ptr(), file_spec().file_path_.length());
     const std::string full_path = directory_path + "/" + entry->d_name;
+    std::string canonical_entry_path;
+    uint64_t entry_device = 0;
+    uint64_t entry_inode = 0;
+    int64_t entry_size = 0;
+    int64_t entry_modified_time_ns = 0;
+    if (OB_SUCCESS != ObFileScanUtils::get_file_fingerprint(
+          full_path, canonical_entry_path, entry_device, entry_inode,
+          entry_size, entry_modified_time_ns)) {
+      continue;
+    }
     ObFileFormat format = ObFileFormat::INVALID;
-    const bool queryable = S_ISREG(entry_stat.st_mode)
-                           && OB_SUCCESS == ObFileScanUtils::detect_format(full_path, format);
-    cells_.assign(6, ObFileCell());
+    const bool queryable = OB_SUCCESS == ObFileScanUtils::detect_format(full_path, format);
+    cells_.assign(ObFileTableKind::GLOB == kind ? 1 : 6, ObFileCell());
     cells_[0].is_null_ = false;
-    cells_[0].string_value_ = entry->d_name;
+    cells_[0].string_value_ = ObFileTableKind::GLOB == kind ? full_path : entry->d_name;
+    if (ObFileTableKind::GLOB == kind) {
+      break;
+    }
     cells_[1].is_null_ = false;
     cells_[1].string_value_ = full_path;
     cells_[2].is_null_ = false;
     cells_[2].string_value_ = queryable ? ObFileScanUtils::format_name(format) : "unknown";
     cells_[3].is_null_ = false;
-    cells_[3].int_value_ = static_cast<int64_t>(entry_stat.st_size);
+    cells_[3].int_value_ = entry_size;
     cells_[4].is_null_ = false;
-    cells_[4].datetime_value_ = static_cast<int64_t>(entry_stat.st_mtime) * 1000000L;
+    cells_[4].datetime_value_ = entry_modified_time_ns / 1000L;
     cells_[5].is_null_ = false;
     cells_[5].bool_value_ = queryable;
     break;
   }
   if (OB_SUCC(ret) && OB_ISNULL(entry)) {
-    struct stat directory_stat;
-    if (0 != fstat(dirfd(directory_), &directory_stat)
-        || static_cast<uint64_t>(directory_stat.st_dev) != file_spec().device_
-        || static_cast<uint64_t>(directory_stat.st_ino) != file_spec().inode_
-        || (static_cast<int64_t>(directory_stat.st_mtim.tv_sec) * 1000000000L
-            + static_cast<int64_t>(directory_stat.st_mtim.tv_nsec))
-           != file_spec().modified_time_ns_) {
+    std::string canonical_path;
+    uint64_t device = 0;
+    uint64_t inode = 0;
+    int64_t modified_time_ns = 0;
+    const std::string path(file_spec().file_path_.ptr(), file_spec().file_path_.length());
+    if (OB_SUCCESS != ObFileScanUtils::get_directory_fingerprint(
+          path, canonical_path, device, inode, modified_time_ns)
+        || canonical_path != path || device != file_spec().device_
+        || inode != file_spec().inode_ || modified_time_ns != file_spec().modified_time_ns_) {
       ret = OB_SCHEMA_EAGAIN;
       LOG_WARN("directory changed while listing", K(ret));
     } else {
@@ -299,7 +323,7 @@ int ObFileScanOp::inner_get_next_row()
       ret = get_next_scan_row();
     } else if (ObFileTableKind::SCHEMA == kind) {
       ret = get_next_schema_row();
-    } else if (ObFileTableKind::LIST == kind) {
+    } else if (ObFileTableKind::LIST == kind || ObFileTableKind::GLOB == kind) {
       ret = get_next_list_row();
     } else {
       ret = OB_ERR_UNEXPECTED;
@@ -329,7 +353,7 @@ int ObFileScanOp::inner_get_next_batch(const int64_t max_row_cnt)
         ret = get_next_scan_row();
       } else if (ObFileTableKind::SCHEMA == kind) {
         ret = get_next_schema_row();
-      } else if (ObFileTableKind::LIST == kind) {
+      } else if (ObFileTableKind::LIST == kind || ObFileTableKind::GLOB == kind) {
         ret = get_next_list_row();
       } else {
         ret = OB_ERR_UNEXPECTED;
