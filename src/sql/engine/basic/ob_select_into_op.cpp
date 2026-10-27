@@ -17,9 +17,12 @@
 #define USING_LOG_PREFIX SQL_ENG
 
 #include <cmath>
+#include <cerrno>
+#include <cstdio>
 #include <memory>
 
 #include "ob_select_into_op.h"
+#include "sql/engine/basic/ob_file_scan_utils.h"
 #include "sql/engine/cmd/ob_variable_set_executor.h"
 #include "lib/charset/ob_charset_string_helper.h"
 #include "sql/engine/px/ob_px_sqc_handler.h"
@@ -342,7 +345,24 @@ int ObSelectIntoOp::inner_rescan()
 int ObSelectIntoOp::inner_close()
 {
   int ret = OB_SUCCESS;
-  if (OB_NOT_NULL(data_writer_) && OB_FAIL(data_writer_->close_data_writer())) {
+  if (OB_NOT_NULL(data_writer_)) {
+    const bool created_file = data_writer_->is_file_opened_;
+    if (need_commit_) {
+      ret = data_writer_->close_data_writer();
+    }
+    if (!need_commit_ || OB_SUCCESS != ret) {
+      // Only remove a file this writer successfully created. An existing-file
+      // open failure must leave the previous file intact.
+      data_writer_->file_appender_.close();
+      data_writer_->is_file_opened_ = false;
+      if (created_file) {
+        const std::string filename(data_writer_->url_.ptr(), data_writer_->url_.length());
+        if (0 != std::remove(filename.c_str()) && ENOENT != errno) {
+          if (OB_SUCCESS == ret) ret = OB_IO_ERROR;
+          LOG_WARN("failed to remove incomplete outfile", K(ret), "filename", filename.c_str());
+        }
+      }
+    }
   }
   return ret;
 }
@@ -1248,24 +1268,40 @@ int ObSelectIntoOp::create_shared_buffer_for_data_writer()
 int ObSelectIntoOp::check_secure_file_path(ObString file_name)
 {
   int ret = OB_SUCCESS;
-  ObString file_path = file_name.split_on(file_name.reverse_find('/'));
-  char full_path_buf[PATH_MAX+1];
-  char *actual_path = nullptr;
-  ObSqlString sql_str;
-  ObString secure_file_priv;
-  
-  if (OB_FAIL(sql_str.append(file_path.empty() ? "." : file_path))) {
+  const char *separator_ptr = file_name.reverse_find('/');
 #ifdef _WIN32
-  } else if (OB_ISNULL(actual_path = _fullpath(full_path_buf, sql_str.ptr(), PATH_MAX))) {
-#else
-  } else if (OB_ISNULL(actual_path = realpath(sql_str.ptr(), full_path_buf))) {
+  const char *backslash = file_name.reverse_find('\\');
+  if (nullptr != backslash && (nullptr == separator_ptr || backslash > separator_ptr)) {
+    separator_ptr = backslash;
+  }
 #endif
-    ret = OB_FILE_NOT_EXIST;
+  const int64_t separator = nullptr == separator_ptr ? -1 : separator_ptr - file_name.ptr();
+  int64_t parent_length = separator;
+  if (0 == separator) {
+    parent_length = 1;
+  }
+#ifdef _WIN32
+  if (2 == separator && file_name.length() > 2 && ':' == file_name.ptr()[1]) {
+    parent_length = 3;
+  }
+#endif
+  std::string parent = separator < 0 ? "."
+      : std::string(file_name.ptr(), parent_length);
+#ifdef _WIN32
+  if (separator < 0 && file_name.length() >= 2 && ':' == file_name.ptr()[1]) {
+    parent.assign(file_name.ptr(), 2);
+    parent += ".";
+  }
+#endif
+  std::string canonical_parent;
+  ObString secure_file_priv;
+  if (OB_FAIL(ObFileScanUtils::canonicalize_path(parent, canonical_parent))) {
   } else if (OB_FAIL(ObSchemaUtils::get_runtime_varchar_variable(*GCTX.schema_service_,
-                                                                SYS_VAR_SECURE_FILE_PRIV,
-                                                                ctx_.get_allocator(),
-                                                                secure_file_priv))) {
-  } else if (OB_FAIL(ObResolverUtils::check_secure_path(secure_file_priv, actual_path))) {
+                                                               SYS_VAR_SECURE_FILE_PRIV,
+                                                               ctx_.get_allocator(),
+                                                               secure_file_priv))) {
+  } else if (OB_FAIL(ObResolverUtils::check_secure_path(
+               secure_file_priv, ObString(static_cast<int32_t>(canonical_parent.size()), canonical_parent.data())))) {
     if (OB_ERR_NO_PRIVILEGE == ret) {
       ret = OB_ERR_NO_PRIV_DIRECT_PATH_ACCESS;
       LOG_ERROR("failed to check secure path", K(ret), K(secure_file_priv));

@@ -40,8 +40,6 @@ int64_t ob_parquet_native_pread(const int fd, void *buffer, const size_t size, c
   return -1 == _lseeki64(fd, offset, SEEK_SET)
        ? -1 : static_cast<int64_t>(_read(fd, buffer, static_cast<unsigned int>(size)));
 }
-int64_t ob_parquet_native_mtime_ns(const ObNativeFileStat &file_stat)
-{ return static_cast<int64_t>(file_stat.st_mtime) * 1000000000L; }
 #else
 using ObNativeFileStat = struct stat;
 int ob_parquet_native_open(const char *path) { return ::open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW); }
@@ -49,16 +47,6 @@ int ob_parquet_native_close(const int fd) { return ::close(fd); }
 int ob_parquet_native_fstat(const int fd, ObNativeFileStat *file_stat) { return fstat(fd, file_stat); }
 int64_t ob_parquet_native_pread(const int fd, void *buffer, const size_t size, const int64_t offset)
 { return pread(fd, buffer, size, offset); }
-int64_t ob_parquet_native_mtime_ns(const ObNativeFileStat &file_stat)
-{
-#if defined(__APPLE__)
-  return static_cast<int64_t>(file_stat.st_mtimespec.tv_sec) * 1000000000L
-       + static_cast<int64_t>(file_stat.st_mtimespec.tv_nsec);
-#else
-  return static_cast<int64_t>(file_stat.st_mtim.tv_sec) * 1000000000L
-       + static_cast<int64_t>(file_stat.st_mtim.tv_nsec);
-#endif
-}
 #endif
 
 enum CompactType : uint8_t
@@ -685,11 +673,17 @@ int open_verified(const std::string &path, const uint64_t expected_device,
     fd = -1;
     ret = OB_FILE_NOT_OPENED;
   } else {
-    const int64_t mtime_ns = ob_parquet_native_mtime_ns(st);
-    if ((0 != expected_device && static_cast<uint64_t>(st.st_dev) != expected_device)
-        || (0 != expected_inode && static_cast<uint64_t>(st.st_ino) != expected_inode)
-        || (expected_size >= 0 && static_cast<int64_t>(st.st_size) != expected_size)
-        || (expected_mtime_ns >= 0 && mtime_ns != expected_mtime_ns)) {
+    uint64_t device = 0;
+    uint64_t inode = 0;
+    int64_t size = 0;
+    int64_t mtime_ns = 0;
+    if (OB_FAIL(ObFileScanUtils::get_open_file_fingerprint(
+          fd, device, inode, size, mtime_ns))) {
+      ob_parquet_native_close(fd); fd = -1;
+    } else if ((0 != expected_device && device != expected_device)
+               || (0 != expected_inode && inode != expected_inode)
+               || (expected_size >= 0 && size != expected_size)
+               || (expected_mtime_ns >= 0 && mtime_ns != expected_mtime_ns)) {
       ob_parquet_native_close(fd); fd = -1; ret = OB_SCHEMA_EAGAIN;
     }
   }

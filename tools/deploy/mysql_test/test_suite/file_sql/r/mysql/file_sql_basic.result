@@ -38,3 +38,23 @@ id	name	score
 1	Alice	98.5
 2	Bob	87
 3	Chen	90.25
+# forced nested-loop rescans preserve every match
+left_id	right_id
+1	1
+2	2
+3	3
+# DESCRIBE keeps a quoted alias as metadata
+column_name	column_type	null	key	default	extra
+quoted'name	BIGINT	NO	NULL	NULL	NULL
+# COPY roundtrip preserves quoted fields and newlines
+id	note
+1	hello,<NL>world
+2	plain
+3	say "hi"
+# COPY failure removes only its own incomplete file
+incomplete_files
+0
+id	name	score
+1	Alice	98.5
+2	Bob	87
+3	Chen	90.25

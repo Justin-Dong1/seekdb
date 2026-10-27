@@ -373,10 +373,11 @@ int ObFileScanOp::inner_get_next_batch(const int64_t max_row_cnt)
         || column_idx >= file_spec().file_column_types_.count()) {
       ret = OB_ERR_UNEXPECTED;
     } else {
-      ObDatum *datums = expr->locate_batch_datums(eval_ctx_);
       const int64_t datum_count = expr->is_batch_result()
                                 ? static_cast<int64_t>(batch_cells_.size())
                                 : std::min<int64_t>(1, batch_cells_.size());
+      // Typed setters write through the datum buffer; prepare it for every batch.
+      ObDatum *datums = expr->locate_datums_for_update(eval_ctx_, datum_count);
       for (int64_t row_idx = 0; OB_SUCC(ret) && row_idx < datum_count; ++row_idx) {
         if (column_idx >= static_cast<int64_t>(batch_cells_.at(row_idx).size())) {
           ret = OB_ERR_UNEXPECTED;
@@ -386,6 +387,9 @@ int ObFileScanOp::inner_get_next_batch(const int64_t max_row_cnt)
                                      datums[row_idx]))) {
           LOG_WARN("failed to write file batch cell", K(ret), K(row_idx), K(column_idx));
         }
+      }
+      if (OB_SUCC(ret)) {
+        expr->set_evaluated_projected(eval_ctx_);
       }
     }
   }
@@ -398,7 +402,10 @@ int ObFileScanOp::inner_get_next_batch(const int64_t max_row_cnt)
 
 int ObFileScanOp::inner_rescan()
 {
-  int ret = inner_close();
+  int ret = ObOperator::inner_rescan();
+  if (OB_SUCC(ret)) {
+    ret = inner_close();
+  }
   if (OB_SUCC(ret)) {
     ret = inner_open();
   }

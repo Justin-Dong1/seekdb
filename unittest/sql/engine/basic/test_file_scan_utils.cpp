@@ -17,6 +17,10 @@
 #include <gtest/gtest.h>
 
 #include <fstream>
+#include <fcntl.h>
+#ifdef _WIN32
+#include <io.h>
+#endif
 #include <unistd.h>
 
 #include "lib/ob_errno.h"
@@ -61,6 +65,41 @@ public:
 private:
   std::string path_;
 };
+
+TEST(FileScanUtils, path_and_open_reader_have_the_same_identity)
+{
+  TempFile file(".csv");
+  file.write("id,value\n1,alpha\n");
+  std::string canonical_path;
+  uint64_t path_device = 0;
+  uint64_t path_inode = 0;
+  int64_t path_size = 0;
+  int64_t path_mtime = 0;
+  ASSERT_EQ(OB_SUCCESS, ObFileScanUtils::get_file_fingerprint(
+      file.path(), canonical_path, path_device, path_inode, path_size, path_mtime));
+#ifdef _WIN32
+  const int fd = _open(canonical_path.c_str(), _O_RDONLY | _O_BINARY);
+#else
+  const int fd = open(canonical_path.c_str(), O_RDONLY);
+#endif
+  ASSERT_GE(fd, 0);
+  uint64_t open_device = 0;
+  uint64_t open_inode = 0;
+  int64_t open_size = 0;
+  int64_t open_mtime = 0;
+  const int ret = ObFileScanUtils::get_open_file_fingerprint(
+      fd, open_device, open_inode, open_size, open_mtime);
+#ifdef _WIN32
+  _close(fd);
+#else
+  close(fd);
+#endif
+  ASSERT_EQ(OB_SUCCESS, ret);
+  EXPECT_EQ(path_device, open_device);
+  EXPECT_EQ(path_inode, open_inode);
+  EXPECT_EQ(path_size, open_size);
+  EXPECT_EQ(path_mtime, open_mtime);
+}
 
 // Cross-implementation fixture produced by Arrow2: one INT32 column containing 0..6,
 // DataPageV2 with a Snappy column codec and an uncompressed value section.
@@ -226,6 +265,21 @@ TEST(TestFileScanUtils, csv_schema_and_streaming)
   EXPECT_EQ(2, cells[0].int_value_);
   EXPECT_TRUE(cells[3].is_null_);
   EXPECT_EQ(OB_ITER_END, reader.get_next_row(cells));
+}
+
+TEST(TestFileScanUtils, rejects_csv_rows_missing_header_fields)
+{
+  TempFile file(".csv");
+  file.write("id,label\n1,first\n2\n");
+  std::vector<ObFileColumnSchema> columns;
+  std::string canonical_path;
+  ObFileFormat format = ObFileFormat::INVALID;
+  int64_t rows = 0;
+  int64_t file_size = 0;
+  int64_t modified_time_ns = 0;
+  EXPECT_EQ(OB_INVALID_DATA, ObFileScanUtils::infer_schema(
+      file.path(), ObFileFormat::CSV, columns, rows, canonical_path,
+      format, file_size, modified_time_ns));
 }
 
 TEST(TestFileScanUtils, jsonl_union_schema)

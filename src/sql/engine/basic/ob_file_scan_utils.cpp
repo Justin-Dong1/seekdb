@@ -34,6 +34,13 @@
 #include <sys/stat.h>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#ifdef ERROR
+#undef ERROR
+#endif
 #include <direct.h>
 #include <io.h>
 #include <stdlib.h>
@@ -59,14 +66,10 @@ namespace
 {
 
 #ifdef _WIN32
-using ObNativeFileStat = struct _stat64;
 int ob_native_open(const char *path) { return _open(path, _O_RDONLY | _O_BINARY); }
 int ob_native_close(const int fd) { return _close(fd); }
 int64_t ob_native_read(const int fd, void *buffer, const size_t size)
 { return static_cast<int64_t>(_read(fd, buffer, static_cast<unsigned int>(size))); }
-int ob_native_fstat(const int fd, ObNativeFileStat *file_stat) { return _fstat64(fd, file_stat); }
-int64_t ob_native_mtime_ns(const ObNativeFileStat &file_stat)
-{ return static_cast<int64_t>(file_stat.st_mtime) * 1000000000L; }
 #else
 using ObNativeFileStat = struct stat;
 int ob_native_open(const char *path) { return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW); }
@@ -82,6 +85,55 @@ int64_t ob_native_mtime_ns(const ObNativeFileStat &file_stat)
   return static_cast<int64_t>(file_stat.st_mtim.tv_sec) * 1000000000L
        + static_cast<int64_t>(file_stat.st_mtim.tv_nsec);
 #endif
+}
+#endif
+
+#ifdef _WIN32
+HANDLE open_windows_file_metadata(const std::string &path)
+{
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                         path.c_str(), -1, nullptr, 0);
+  if (length > 0) {
+    std::vector<wchar_t> wide_path(length);
+    if (0 != MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.c_str(),
+                                 -1, wide_path.data(), length)) {
+      handle = CreateFileW(wide_path.data(), FILE_READ_ATTRIBUTES,
+                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                          nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    }
+  }
+  return handle;
+}
+
+int windows_file_fingerprint(HANDLE handle, const bool require_directory,
+                             uint64_t &device, uint64_t &inode,
+                             int64_t &size, int64_t &modified_time_ns)
+{
+  int ret = OB_SUCCESS;
+  BY_HANDLE_FILE_INFORMATION info;
+  if (FILE_TYPE_DISK != GetFileType(handle)
+      || !GetFileInformationByHandle(handle, &info)) {
+    ret = OB_IO_ERROR;
+  } else if (require_directory != (0 != (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))) {
+    ret = OB_INVALID_DATA;
+  } else {
+    const uint64_t bytes = (static_cast<uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+    const uint64_t ticks = (static_cast<uint64_t>(info.ftLastWriteTime.dwHighDateTime) << 32)
+                           | info.ftLastWriteTime.dwLowDateTime;
+    const uint64_t epoch = 116444736000000000ULL;
+    const uint64_t delta = ticks >= epoch ? ticks - epoch : epoch - ticks;
+    if (bytes > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
+        || delta > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) / 100) {
+      ret = OB_INVALID_DATA;
+    } else {
+      device = info.dwVolumeSerialNumber;
+      inode = (static_cast<uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
+      size = static_cast<int64_t>(bytes);
+      modified_time_ns = static_cast<int64_t>(delta * 100) * (ticks >= epoch ? 1 : -1);
+    }
+  }
+  return ret;
 }
 #endif
 
@@ -125,25 +177,20 @@ int open_safe_input_stream(const std::string &path,
 {
   int ret = OB_SUCCESS;
   const int fd = ob_native_open(path.c_str());
-  ObNativeFileStat file_stat;
+  uint64_t device = 0;
+  uint64_t inode = 0;
+  int64_t size = 0;
+  int64_t mtime_ns = 0;
   if (fd < 0) {
     ret = OB_FILE_NOT_OPENED;
-  } else if (0 != ob_native_fstat(fd, &file_stat) || !S_ISREG(file_stat.st_mode)) {
+  } else if (OB_FAIL(ObFileScanUtils::get_open_file_fingerprint(
+               fd, device, inode, size, mtime_ns))) {
     ob_native_close(fd);
-    ret = OB_INVALID_DATA;
   } else {
-    if (nullptr != opened_device) {
-      *opened_device = static_cast<uint64_t>(file_stat.st_dev);
-    }
-    if (nullptr != opened_inode) {
-      *opened_inode = static_cast<uint64_t>(file_stat.st_ino);
-    }
-    if (nullptr != opened_size) {
-      *opened_size = static_cast<int64_t>(file_stat.st_size);
-    }
-    if (nullptr != opened_mtime_ns) {
-      *opened_mtime_ns = ob_native_mtime_ns(file_stat);
-    }
+    if (nullptr != opened_device) *opened_device = device;
+    if (nullptr != opened_inode) *opened_inode = inode;
+    if (nullptr != opened_size) *opened_size = size;
+    if (nullptr != opened_mtime_ns) *opened_mtime_ns = mtime_ns;
     buffer.reset(new (std::nothrow) SafeFileStreamBuf(fd));
     if (!buffer) {
       ob_native_close(fd);
@@ -711,7 +758,7 @@ int infer_csv_schema(const std::string &path,
       break;
     } else if (OB_FAIL(ret)) {
       break;
-    } else if (fields.size() > columns.size()) {
+    } else if (fields.size() != columns.size()) {
       ret = OB_INVALID_DATA;
     } else {
       ++row_count;
@@ -847,11 +894,39 @@ int ObFileScanUtils::canonicalize_path(const std::string &path, std::string &can
 {
   int ret = OB_SUCCESS;
 #ifdef _WIN32
-  char resolved_path[_MAX_PATH];
-  if (nullptr == _fullpath(resolved_path, path.c_str(), sizeof(resolved_path))) {
+  HANDLE handle = open_windows_file_metadata(path);
+  if (INVALID_HANDLE_VALUE == handle) {
     ret = OB_FILE_NOT_OPENED;
   } else {
-    canonical_path.assign(resolved_path);
+    const DWORD flags = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS;
+    const DWORD required = GetFinalPathNameByHandleW(handle, nullptr, 0, flags);
+    std::vector<wchar_t> final_path(required);
+    const DWORD length = required > 0
+                       ? GetFinalPathNameByHandleW(handle, final_path.data(), required, flags) : 0;
+    if (0 == length || length >= required) {
+      ret = OB_FILE_NOT_OPENED;
+    } else {
+      std::wstring normalized(final_path.data(), length);
+      if (0 == normalized.compare(0, 8, L"\\\\?\\UNC\\")) {
+        normalized = L"\\\\" + normalized.substr(8);
+      } else if (0 == normalized.compare(0, 4, L"\\\\?\\")) {
+        normalized.erase(0, 4);
+      }
+      const int bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                                            normalized.data(), normalized.size(),
+                                            nullptr, 0, nullptr, nullptr);
+      if (bytes <= 0) {
+        ret = OB_INVALID_DATA;
+      } else {
+        canonical_path.resize(bytes);
+        if (0 == WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                                     normalized.data(), normalized.size(),
+                                     &canonical_path[0], bytes, nullptr, nullptr)) {
+          ret = OB_INVALID_DATA;
+        }
+      }
+    }
+    CloseHandle(handle);
   }
 #else
   char resolved_path[PATH_MAX];
@@ -875,6 +950,37 @@ int ObFileScanUtils::get_file_fingerprint(const std::string &path,
                               file_size, modified_time_ns);
 }
 
+int ObFileScanUtils::get_open_file_fingerprint(const int fd,
+                                               uint64_t &device,
+                                               uint64_t &inode,
+                                               int64_t &file_size,
+                                               int64_t &modified_time_ns)
+{
+  int ret = OB_SUCCESS;
+#ifdef _WIN32
+  const intptr_t raw_handle = _get_osfhandle(fd);
+  if (-1 == raw_handle) {
+    ret = OB_FILE_NOT_OPENED;
+  } else {
+    ret = windows_file_fingerprint(reinterpret_cast<HANDLE>(raw_handle), false,
+                                   device, inode, file_size, modified_time_ns);
+  }
+#else
+  ObNativeFileStat file_stat;
+  if (0 != ob_native_fstat(fd, &file_stat)) {
+    ret = OB_IO_ERROR;
+  } else if (!S_ISREG(file_stat.st_mode)) {
+    ret = OB_INVALID_DATA;
+  } else {
+    device = static_cast<uint64_t>(file_stat.st_dev);
+    inode = static_cast<uint64_t>(file_stat.st_ino);
+    file_size = static_cast<int64_t>(file_stat.st_size);
+    modified_time_ns = ob_native_mtime_ns(file_stat);
+  }
+#endif
+  return ret;
+}
+
 namespace
 {
 int get_path_fingerprint(const std::string &path,
@@ -886,28 +992,36 @@ int get_path_fingerprint(const std::string &path,
                          int64_t &modified_time_ns)
 {
   int ret = OB_SUCCESS;
-  struct stat path_stat;
   if (OB_FAIL(ObFileScanUtils::canonicalize_path(path, canonical_path))) {
     LOG_WARN("failed to canonicalize file path", K(ret));
-  } else if (0 != stat(canonical_path.c_str(), &path_stat)) {
-    ret = OB_FILE_NOT_OPENED;
-  } else if ((require_directory && !S_ISDIR(path_stat.st_mode))
-             || (!require_directory && !S_ISREG(path_stat.st_mode))) {
-    ret = OB_INVALID_DATA;
-  } else {
-    device = static_cast<uint64_t>(path_stat.st_dev);
-    inode = static_cast<uint64_t>(path_stat.st_ino);
-    file_size = static_cast<int64_t>(path_stat.st_size);
-#if defined(_WIN32)
-    modified_time_ns = static_cast<int64_t>(path_stat.st_mtime) * 1000000000L;
-#elif defined(__APPLE__)
-    modified_time_ns = static_cast<int64_t>(path_stat.st_mtimespec.tv_sec) * 1000000000L
-                     + static_cast<int64_t>(path_stat.st_mtimespec.tv_nsec);
-#else
-    modified_time_ns = static_cast<int64_t>(path_stat.st_mtim.tv_sec) * 1000000000L
-                     + static_cast<int64_t>(path_stat.st_mtim.tv_nsec);
-#endif
   }
+#ifdef _WIN32
+  else {
+    HANDLE handle = open_windows_file_metadata(canonical_path);
+    if (INVALID_HANDLE_VALUE == handle) {
+      ret = OB_FILE_NOT_OPENED;
+    } else {
+      ret = windows_file_fingerprint(handle, require_directory,
+                                     device, inode, file_size, modified_time_ns);
+      CloseHandle(handle);
+    }
+  }
+#else
+  else {
+    struct stat path_stat;
+    if (0 != stat(canonical_path.c_str(), &path_stat)) {
+      ret = OB_FILE_NOT_OPENED;
+    } else if ((require_directory && !S_ISDIR(path_stat.st_mode))
+               || (!require_directory && !S_ISREG(path_stat.st_mode))) {
+      ret = OB_INVALID_DATA;
+    } else {
+      device = static_cast<uint64_t>(path_stat.st_dev);
+      inode = static_cast<uint64_t>(path_stat.st_ino);
+      file_size = static_cast<int64_t>(path_stat.st_size);
+      modified_time_ns = ob_native_mtime_ns(path_stat);
+    }
+  }
+#endif
   return ret;
 }
 } // namespace
@@ -1239,7 +1353,7 @@ int ObFileScanReader::get_next_csv_row(std::vector<ObFileCell> &cells)
     ret = OB_NOT_INIT;
   } else if (OB_FAIL(read_csv_record(*stream_, fields, has_record))) {
     // return iterator end or parse error
-  } else if (fields.size() > columns_.size()) {
+  } else if (fields.size() != columns_.size()) {
     ret = OB_INVALID_DATA;
   } else {
     ++current_row_number_;

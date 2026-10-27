@@ -8490,6 +8490,30 @@ COPY '(' select_no_parens ')' TO STRING_VALUE
                            format_option, header_option);
   malloc_non_terminal_node(options, result->malloc_pool_, T_LINK_NODE, 2,
                            options, null_option);
+  /* COPY CSV defaults differ from SELECT INTO OUTFILE's tab-separated format. */
+  ParseNode *delimiter_value = NULL;
+  ParseNode *delimiter_option = NULL;
+  ParseNode *quote_value = NULL;
+  ParseNode *quote_option = NULL;
+  ParseNode *escape_option = NULL;
+  malloc_terminal_node(delimiter_value, result->malloc_pool_, T_VARCHAR);
+  delimiter_value->str_value_ = ",";
+  delimiter_value->str_len_ = 1;
+  malloc_non_terminal_node(delimiter_option, result->malloc_pool_, T_FIELD_TERMINATED_STR, 1, delimiter_value);
+  delimiter_option->str_value_ = "','";
+  delimiter_option->str_len_ = 3;
+  malloc_terminal_node(quote_value, result->malloc_pool_, T_VARCHAR);
+  quote_value->str_value_ = "\"";
+  quote_value->str_len_ = 1;
+  malloc_non_terminal_node(quote_option, result->malloc_pool_, T_OPTIONALLY_CLOSED_STR, 1, quote_value);
+  quote_option->str_value_ = "'\"'";
+  quote_option->str_len_ = 3;
+  malloc_non_terminal_node(escape_option, result->malloc_pool_, T_ESCAPED_STR, 1, quote_value);
+  escape_option->str_value_ = "'\"'";
+  escape_option->str_len_ = 3;
+  malloc_non_terminal_node(options, result->malloc_pool_, T_LINK_NODE, 2, options, delimiter_option);
+  malloc_non_terminal_node(options, result->malloc_pool_, T_LINK_NODE, 2, options, quote_option);
+  malloc_non_terminal_node(options, result->malloc_pool_, T_LINK_NODE, 2, options, escape_option);
   merge_nodes(format_list, result, T_EXTERNAL_FILE_FORMAT, options);
   malloc_non_terminal_node(into_node, result->malloc_pool_, T_INTO_OUTFILE, 3,
                            $6, format_list, NULL);
@@ -12337,7 +12361,16 @@ explain_or_desc relation_factor opt_desc_column_option
   malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_COLUMNS, 4, $$, $2, NULL, $3);
 }
 
-| explain_or_desc explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL);}
+| explain_or_desc explainable_stmt
+{
+  GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL);
+  /* Preserve DESCRIBE's schema intent; EXPLAIN continues to produce a plan. */
+  /* value_ is reserved for the statement parameter count. */
+  if (NULL != $1) {
+    $$->str_value_ = $1->str_value_;
+    $$->str_len_ = $1->str_len_;
+  }
+}
 | explain_or_desc PRETTY explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, T_PRETTY, $3, NULL, NULL);}
 | explain_or_desc PRETTY_COLOR explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, T_PRETTY_COLOR, $3, NULL, NULL);}
 
@@ -12378,8 +12411,14 @@ explain_or_desc relation_factor opt_desc_column_option
 
 explain_or_desc:
 EXPLAIN {$$ = NULL;}
-| DESCRIBE {$$ = NULL;}
-| DESC  {$$ = NULL;}
+| DESCRIBE
+{
+  get_non_reserved_node($$, result->malloc_pool_, @1.first_column, @1.last_column);
+}
+| DESC
+{
+  get_non_reserved_node($$, result->malloc_pool_, @1.first_column, @1.last_column);
+}
 ;
 
 explainable_stmt:
@@ -17683,6 +17722,10 @@ file_scan_option_name:
 relation_name
 {
   $$ = $1;
+}
+| HEADER
+{
+  get_non_reserved_node($$, result->malloc_pool_, @1.first_column, @1.last_column);
 }
 ;
 

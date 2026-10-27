@@ -83,6 +83,12 @@ public:
                                   uint64_t &inode,
                                   int64_t &file_size,
                                   int64_t &modified_time_ns);
+  // Use the same identity source for pathname checks and already-open readers.
+  static int get_open_file_fingerprint(int fd,
+                                       uint64_t &device,
+                                       uint64_t &inode,
+                                       int64_t &file_size,
+                                       int64_t &modified_time_ns);
   static int get_directory_fingerprint(const std::string &path,
                                        std::string &canonical_path,
                                        uint64_t &device,
