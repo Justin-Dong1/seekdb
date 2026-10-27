@@ -1,0 +1,63 @@
+# Full-text token processing optimization
+
+Base revision: `76f871eb5a84b664d487b03b3412ce50194135b5` (`2026-competition`).
+
+## Bottleneck and changes
+
+`ObAddWord::groupby_word` previously fetched a count and then overwrote the
+hash-map entry. Inspection of `ObHashTable::set_refactored` shows that this
+overwrite allocates a replacement node and frees the previous node. Every
+repeated token therefore performed two hashes, two bucket acquisitions, and
+node replacement. The implementation now uses the existing `set_or_update`
+API, updating the count under the bucket lock and allocating only for new keys.
+It retains the last spelling of collation-equivalent keys and the original
+initial-count semantics, including token frequencies greater than one.
+
+`ObStopWordChecker::check_stopword` constructed an arena allocator for every
+token, including UTF-8 inputs for which charset conversion merely aliases the
+input. Valid UTF-8 collations now directly probe the existing stopword set with
+its original UTF8MB4_GENERAL_CI metadata. Other inputs still take the original
+conversion path. Case/accent-insensitive matching and invalid-collation errors
+are retained. No shared cache or new parser state is introduced.
+
+## Correctness
+
+`unittest/storage/fts/test_fts_token_hotpath.cpp` covers all built-in stopwords,
+the three supported UTF-8 collations, binary conversion, uppercase and accented
+tokens, invalid/unsupported collations, uninitialized state, repeated words,
+frequency accumulation, last spelling, map reuse, and non-grouping duplicates.
+The same three regression groups passed against both baseline and changed
+production FTS translation units.
+
+## Local component measurement
+
+Windows x64, Clang 18, optimized `/O2` build. A standalone test executable links
+the actual FTS translation unit and existing seekdb dependencies. The local
+dependency build needed a test-only scalar implementation of the newer MSVC
+`__std_find_first_of_trivial_pos_1` runtime entry point referenced by prebuilt
+gRPC. This compatibility file is outside the product repository and is linked
+identically in both executables; it does not implement any FTS behavior.
+
+Each sample executes 1,000,000 stopword checks and 1,000,000 word additions over
+eight synthetic tokens. Five alternating baseline/optimized runs after initial
+warmup gave the following times, in milliseconds:
+
+| Run | Baseline stopword | Optimized stopword | Baseline grouping | Optimized grouping |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 71.211 | 60.099 | 200.791 | 90.460 |
+| 2 | 70.722 | 71.112 | 205.418 | 92.733 |
+| 3 | 69.297 | 60.418 | 200.438 | 90.475 |
+| 4 | 69.401 | 59.647 | 201.641 | 88.168 |
+| 5 | 69.286 | 59.998 | 198.787 | 89.317 |
+| Median | 69.401 | 60.099 | 200.791 | 90.460 |
+
+Median time reductions are approximately 13.4% and 54.9%, respectively. Every
+run verifies stopword outputs and all accumulated token counts. The standalone
+entry point and measurement are enabled only by `FTS_HOTPATH_STANDALONE`; the
+default source exposes Google Test cases for the storage test suite.
+
+These are component measurements, not end-to-end database results or an
+official score. The full fixed 20,000-document Linux benchmark has not been run
+locally against this build. Official index-build, TOKENIZE and MATCH performance
+and integration correctness still require the competition evaluator. Benchmark
+inputs, SQL, scoring scripts, and baseline files are unchanged.
