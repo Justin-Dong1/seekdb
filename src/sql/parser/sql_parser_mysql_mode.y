@@ -271,7 +271,7 @@ END_P SET_VAR DELIMITER
 
         CACHE CALIBRATION CALIBRATION_INFO CALC_PARTITION_ID CANCEL CASCADED CAST CATALOG_NAME CHAIN CHANGED CHARSET CHECKSUM CHECKPOINT CHUNK CIPHER CLIENT
         CLASS_ORIGIN CLEAN CLEAR CLOG CLOSE COALESCE COLUMN_STAT
-        CODE COLLATION COLUMN_FORMAT COLUMN_NAME COLUMNS COMMENT COMMIT COMMITTED COMPACT COMPLETE COPY
+        CODE COLLATION COLUMN_FORMAT COLUMN_NAME COLUMNS COMMENT COMMIT COMMITTED COMPACT COMPLETE COPY CSV
         COMPRESSED COMPRESSION COMPRESSION_CODE COMPUTATION CONCURRENT CONDENSED CONDITIONAL CONNECTION CONSISTENT CONSISTENT_MODE CONSTRAINT_CATALOG
         CONSTRAINT_NAME CONSTRAINT_SCHEMA CONTAINS CONTRIBUTORS COSINE COUNT CPU CREATE_TIMESTAMP
         CTXCAT CTX_ID CUBE CURDATE CURRENT STACKED CURTIME CURSOR_NAME CUME_DIST CYCLE CONNECT
@@ -292,7 +292,7 @@ END_P SET_VAR DELIMITER
         GENERAL GEOMETRY GEOMCOLLECTION GEOMETRYCOLLECTION GET_FORMAT GLOBAL GLOB GRANTS GROUP_CONCAT GROUPING
         GLOBAL_ALIAS
 
-        HASH HEAP HELP HISTOGRAM HOUR HIDDEN HYBRID HYBRID_HIST HYBRID_SEARCH
+        HASH HEADER HEAP HELP HISTOGRAM HOUR HIDDEN HYBRID HYBRID_HIST HYBRID_SEARCH
 
         IDENTIFIED IK_MODE ILOG IMMEDIATE IMPORT INCLUDING INCR INDEXES INFO
         INNODB INPLACE INSERT_METHOD INSTANT INSTANCE INVOKER IO IO_THREAD IPC ISOLATE ISOLATION ISSUER
@@ -318,7 +318,7 @@ END_P SET_VAR DELIMITER
 
         NAME NAMES NAMESPACE NATIONAL NCHAR NDB NDBCLUSTER NESTED NEW NEXT NO NOAUDIT NONE NORMAL NOW NOWAIT NEVER NGRAM_TOKEN_SIZE
         NO_WAIT NULLS NUMBER NVARCHAR NTILE NTH_VALUE NETWORK NOPARALLEL
-        NULL_IF_EXETERNAL
+        NULL_IF_EXETERNAL NULLSTR
 
         OBSOLETE OBJECT OCCUR OF OFF OFFSET OLD OLD_PASSWORD ONE ONE_SHOT ONLY OPEN OPTIONS ORDINALITY OURS OLD_KEY OVER
         OJ
@@ -372,7 +372,7 @@ END_P SET_VAR DELIMITER
         ORGANIZATION
 //-----------------------------non_reserved keyword end---------------------------------------------
 %type <node> sql_stmt stmt_list stmt opt_end_p
-%type <node> select_stmt update_stmt delete_stmt
+%type <node> select_stmt copy_stmt update_stmt delete_stmt
 %type <node> insert_stmt single_table_insert values_clause dml_table_name
 %type <node> create_table_stmt create_table_like_stmt fork_table_stmt fork_database_stmt diff_table_stmt merge_table_stmt opt_table_option_list table_option_list table_option table_option_list_space_seperated parallel_option lob_storage_clause lob_storage_parameter lob_storage_parameters lob_chunk_size
 %type <node> index_or_heap
@@ -558,6 +558,7 @@ opt_end_p:
 /* only preparable statement will set question mark size */
 stmt:
     select_stmt             { $$ = $1; question_mark_issue($$, result); }
+  | copy_stmt               { $$ = $1; question_mark_issue($$, result); }
   | insert_stmt             { $$ = $1; question_mark_issue($$, result); }
   | create_table_stmt       {
     $$ = $1;
@@ -8452,6 +8453,55 @@ select_no_parens opt_when
 | with_select
 {
   $$ = $1;
+}
+;
+
+// DuckDB-compatible export syntax used by the file SQL competition task.
+// Reuse the mature SELECT INTO OUTFILE resolver and execution path.
+copy_stmt:
+COPY '(' select_no_parens ')' TO STRING_VALUE
+  '(' FORMAT CSV ',' HEADER ',' NULLSTR STRING_VALUE ')'
+{
+  ParseNode *format_value = NULL;
+  ParseNode *format_option = NULL;
+  ParseNode *header_value = NULL;
+  ParseNode *header_option = NULL;
+  ParseNode *null_list = NULL;
+  ParseNode *null_option = NULL;
+  ParseNode *options = NULL;
+  ParseNode *format_list = NULL;
+  ParseNode *into_node = NULL;
+
+  malloc_terminal_node(format_value, result->malloc_pool_, T_VARCHAR);
+  format_value->str_value_ = "csv";
+  format_value->str_len_ = 3;
+  malloc_non_terminal_node(format_option, result->malloc_pool_,
+                           T_EXTERNAL_FILE_FORMAT_TYPE, 1, format_value);
+
+  malloc_terminal_node(header_value, result->malloc_pool_, T_BOOL);
+  header_value->value_ = 1;
+  malloc_non_terminal_node(header_option, result->malloc_pool_,
+                           T_PARSE_HEADER, 1, header_value);
+
+  malloc_non_terminal_node(null_list, result->malloc_pool_, T_EXPR_LIST, 1, $14);
+  malloc_non_terminal_node(null_option, result->malloc_pool_,
+                           T_NULL_IF_EXETERNAL, 1, null_list);
+  malloc_non_terminal_node(options, result->malloc_pool_, T_LINK_NODE, 2,
+                           format_option, header_option);
+  malloc_non_terminal_node(options, result->malloc_pool_, T_LINK_NODE, 2,
+                           options, null_option);
+  merge_nodes(format_list, result, T_EXTERNAL_FILE_FORMAT, options);
+  malloc_non_terminal_node(into_node, result->malloc_pool_, T_INTO_OUTFILE, 3,
+                           $6, format_list, NULL);
+
+  $$ = $3;
+  if ($$->children_[PARSE_SELECT_INTO] != NULL
+      || $$->children_[PARSE_SELECT_INTO_EXTRA] != NULL) {
+    yyerror(&@1, result, "COPY query must not contain INTO\n");
+    YYERROR;
+  } else {
+    $$->children_[PARSE_SELECT_INTO_EXTRA] = into_node;
+  }
 }
 ;
 
