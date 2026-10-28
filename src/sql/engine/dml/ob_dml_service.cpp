@@ -18,6 +18,7 @@
 #include "config_bridge.h"
 #include "sql/engine/dml/ob_dml_service.h"
 #include "sql/engine/expr/ob_datum_cast.h"
+#include "sql/engine/expr/ob_expr_uuid.h"
 #include "share/rc/ob_server_runtime.h"
 #include "sql/das/ob_das_insert_op.h"
 #include "sql/das/ob_das_delete_op.h"
@@ -595,6 +596,126 @@ int ObDMLService::init_heap_table_pk_for_ins(const ObInsCtDef &ins_ctdef, ObEval
   return ret;
 }
 
+namespace {
+int append_ai_hex_literal(ObSqlString &sql, const ObString &value)
+{
+  int ret = sql.append("X'");
+  for (int64_t i = 0; OB_SUCC(ret) && i < value.length(); ++i) {
+    ret = sql.append_fmt("%02x", static_cast<unsigned char>(value.ptr()[i]));
+  }
+  if (OB_SUCC(ret)) { ret = sql.append("'"); }
+  return ret;
+}
+
+// Execute through the DML operator's external-session connection so the task
+// shares the user's transaction and statement rollback boundary.
+int maintain_ai_tasks(const ObDMLBaseCtDef &ctdef, ObTableModifyOp &op, bool deleting)
+{
+  int ret = OB_SUCCESS;
+  if (is_inner_table(ctdef.das_base_ctdef_.index_tid_)) { return ret; }
+  const share::schema::ObTableSchema *table = nullptr;
+  auto *guard = op.get_exec_ctx().get_sql_ctx()->schema_guard_;
+  if (OB_ISNULL(guard)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(guard->get_table_schema(ctdef.das_base_ctdef_.index_tid_, table))) {
+  } else if (OB_ISNULL(table)) {
+    ret = OB_SCHEMA_ERROR;
+  }
+  bool has_ai = false;
+  for (int64_t i = 0; OB_SUCC(ret) && i < table->get_column_count(); ++i) {
+    has_ai |= table->get_column_schema_by_idx(i)->is_ai_column();
+  }
+  if (OB_FAIL(ret) || !has_ai) { return ret; }
+  if (ctdef.das_base_ctdef_.is_ignore_ || ctdef.is_table_without_pk_) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI COLUMN insert without an explicit primary key or with IGNORE");
+    return ret;
+  }
+  ObArenaAllocator allocator("AiInsertTask");
+  const auto &row = deleting ? ctdef.old_row_ : ctdef.new_row_;
+  ObSqlString snapshot, predicate, sql;
+  int64_t values = 0, keys = 0;
+  char request[37] = {};
+  OZ(ObExprUuid::gen_server_uuid(request, UuidCommon::LENGTH_UUID));
+  OZ(snapshot.append("SELECT "));
+  for (int64_t i = 0; OB_SUCC(ret) && i < ctdef.column_ids_.count(); ++i) {
+    const auto *column = table->get_column_schema(ctdef.column_ids_.at(i));
+    if (column == nullptr || i >= row.count()) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (column->is_ai_column()) {
+      // An AI result is unavailable until the committed task is completed.
+      if (!deleting) {
+        row.at(i)->locate_datum_for_write(op.get_eval_ctx()).set_null();
+        row.at(i)->get_eval_info(op.get_eval_ctx()).evaluated_ = true;
+      }
+    } else if (!column->is_hidden() && (!deleting || column->is_rowkey_column())) {
+      ObDatum *datum = nullptr;
+      ObObj object;
+      char *literal = nullptr;
+      int64_t capacity = 0, length = 0;
+      ObSqlString quoted_name;
+      OZ(quoted_name.append("`"));
+      const ObString &name = column->get_column_name_str();
+      for (int64_t n = 0; OB_SUCC(ret) && n < name.length(); ++n) {
+        if (name.ptr()[n] == '`') { OZ(quoted_name.append("`")); }
+        OZ(quoted_name.append(name.ptr() + n, 1));
+      }
+      OZ(quoted_name.append("`"));
+      OZ(row.at(i)->eval(op.get_eval_ctx(), datum));
+      if (OB_SUCC(ret)) { OZ(datum->to_obj(object, row.at(i)->obj_meta_)); }
+      OZ(object.print_sql_literal(literal, capacity, length, allocator, op.get_obj_print_params()));
+      if (values++ > 0) { OZ(snapshot.append(", ")); }
+      OZ(snapshot.append(literal, length));
+      OZ(snapshot.append_fmt(" AS %s", quoted_name.ptr()));
+      if (column->is_rowkey_column()) {
+        if (keys++ > 0) { OZ(predicate.append(" AND ")); }
+        OZ(predicate.append_fmt("%s = ", quoted_name.ptr()));
+        OZ(predicate.append(literal, length));
+      }
+    }
+  }
+  if (OB_SUCC(ret) && keys == 0) { ret = OB_ERR_UNEXPECTED; }
+  if (deleting) {
+    OZ(sql.append_fmt("DELETE FROM oceanbase.__all_ai_column_task WHERE table_id=%lu AND rowkey_predicate=",
+                     table->get_table_id()));
+    OZ(append_ai_hex_literal(sql, predicate.string()));
+  } else {
+  OZ(sql.append("INSERT INTO oceanbase.__all_ai_column_task "
+      "(task_id,table_id,column_id,schema_version,request_id,rowkey_predicate,"
+      "request_payload,result_spec,max_retries,eligible_ts) SELECT uuid(),"
+      "table_id,column_id,schema_version,"));
+  OZ(append_ai_hex_literal(sql, ObString::make_string(request)));
+  OZ(sql.append(","));
+  OZ(append_ai_hex_literal(sql, predicate.string()));
+  OZ(sql.append(","));
+  OZ(append_ai_hex_literal(sql, snapshot.string()));
+  OZ(sql.append_fmt(",result_spec,max_retries,now(6) FROM oceanbase.__all_ai_column WHERE table_id=%lu",
+                   table->get_table_id()));
+  }
+  bool nested = false;
+  // The cascade marker is the existing DML nested-write transaction guard:
+  // it prevents the inner INSERT from ending/committing the outer statement.
+  // Restore it even on failure, including when invoked inside a real cascade.
+  auto &das_ctx = op.get_exec_ctx().get_das_ctx();
+  const bool was_cascading = das_ctx.is_fk_cascading_;
+  OZ(op.open_inner_conn());
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(op.begin_nested_session(false))) {
+    } else {
+      nested = true;
+      das_ctx.is_fk_cascading_ = true;
+      ret = op.execute_write(sql.ptr());
+    }
+  }
+  if (nested) {
+    const int end_ret = op.end_nested_session();
+    if (OB_SUCC(ret)) { ret = end_ret; }
+  }
+  das_ctx.is_fk_cascading_ = was_cascading;
+  return ret;
+}
+} // namespace
+
 int ObDMLService::process_insert_row(const ObInsCtDef &ins_ctdef,
                                      ObInsRtDef &ins_rtdef,
                                      ObTableModifyOp &dml_op,
@@ -630,7 +751,9 @@ int ObDMLService::process_insert_row(const ObInsCtDef &ins_ctdef,
                                       dml_op))) {
     } else if (OB_FAIL(check_filter_row(ins_ctdef, dml_op.get_eval_ctx(), is_skipped))) {
     }
-
+    if (OB_SUCC(ret) && !is_skipped) {
+      ret = maintain_ai_tasks(ins_ctdef, dml_op, false);
+    }
   }
   return ret;
 }
@@ -729,6 +852,9 @@ int ObDMLService::process_delete_row(const ObDelCtDef &del_ctdef,
       } else if (OB_FAIL(TriggerHandle::do_handle_before_row(
           dml_op, del_ctdef.das_base_ctdef_, del_ctdef.trig_ctdef_, del_rtdef.trig_rtdef_))) {
       }
+    }
+    if (OB_SUCC(ret) && !is_skipped) {
+      ret = maintain_ai_tasks(del_ctdef, dml_op, true);
     }
     LOG_DEBUG("process delete row", K(ret), K(is_skipped),
                "old_row", ROWEXPR2STR(dml_op.get_eval_ctx(), del_ctdef.old_row_));
