@@ -896,6 +896,37 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
       }
     }
 
+    // Hidden physical values track the asynchronous result independently of the
+    // user's nullable result column. Allocate them after all user column IDs.
+    if (OB_SUCC(ret) && RESOLVE_NON_COL != resolve_rule) {
+      const int64_t visible_count = table_schema.get_column_count();
+      for (int64_t i = 0; OB_SUCC(ret) && i < visible_count; ++i) {
+        const ObColumnSchemaV2 *ai_column = table_schema.get_column_schema_by_idx(i);
+        if (ai_column != nullptr && ai_column->is_ai_column()) {
+          const uint64_t result_id = ai_column->get_column_id();
+          const char *suffixes[] = {"state", "request", "result_spec"};
+          for (int k = 0; OB_SUCC(ret) && k < 3; ++k) {
+            ObColumnSchemaV2 hidden;
+            ObSqlString name;
+            hidden.set_column_id(++cur_column_id_);
+            hidden.set_table_id(table_schema.get_table_id());
+            hidden.set_is_hidden(true);
+            hidden.set_nullable(true);
+            hidden.set_data_type(k == 0 ? ObIntType : ObVarcharType);
+            hidden.set_charset_type(k == 0 ? CHARSET_BINARY : CHARSET_UTF8MB4);
+            hidden.set_collation_type(k == 0 ? CS_TYPE_BINARY : CS_TYPE_UTF8MB4_BIN);
+            if (k != 0) {
+              hidden.set_data_length(k == 1 ? 36 : 4096);
+            }
+            if (OB_FAIL(name.append_fmt("__ai_%lu_%s", result_id, suffixes[k]))) {
+            } else if (OB_FAIL(hidden.set_column_name(name.string()))) {
+            } else if (OB_FAIL(table_schema.add_column(hidden))) {
+            }
+          }
+        }
+      }
+    }
+
     // A table must have at least one column as a visible column
     if (OB_SUCC(ret)) {
       // RESOLVE_NON_COL == resolve_rule when, only parse non-column definitions

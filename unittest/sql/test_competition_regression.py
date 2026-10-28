@@ -68,6 +68,7 @@ def run_suite(connection, root, suite, case, fixtures, mock_port):
     output = []
     pending = []
     query_log = result_log = True
+    warnings = True
     errors = {0}
     statements = 0
     with connection.cursor() as cursor:
@@ -89,7 +90,7 @@ def run_suite(connection, root, suite, case, fixtures, mock_port):
                 elif line.startswith('--error '):
                     errors = {int(number) for number in line[8:].split(',')}
                 elif line in ('--disable_warnings', '--enable_warnings'):
-                    pass
+                    warnings = line == '--enable_warnings'
                 elif line.startswith('--source mysql_test/test_suite/file_sql/include/'):
                     # Fixtures are copied locally below instead of over ssh/scp.
                     pass
@@ -117,14 +118,28 @@ def run_suite(connection, root, suite, case, fixtures, mock_port):
                     output.append('\t'.join(item[0] for item in cursor.description))
                     output.extend('\t'.join(format_value(value) for value in row)
                                   for row in cursor.fetchall())
+                if suite == 'ai_column' and warnings and result_log and cursor.warning_count:
+                    cursor.execute('SHOW WARNINGS')
+                    output.append('Warnings:')
+                    output.extend('\t'.join(format_value(value) for value in row)
+                                  for row in cursor.fetchall())
             except pymysql.MySQLError as error:
                 if error.args[0] not in errors:
                     raise AssertionError(f'Statement {statements}: {query}') from error
+                if suite == 'ai_column' and result_log:
+                    sqlstates = {7600: '22000', 1235: '0A000'}
+                    # Cleanup permits a missing model/endpoint without recording it.
+                    if 0 not in errors:
+                        output.append(f'ERROR {sqlstates[error.args[0]]}: {error.args[1]}')
             pending = []
             errors = {0}
     if pending:
         raise AssertionError('Unterminated SQL')
     actual = '\n'.join(output) + '\n'
+    if suite == 'ai_column':
+        # The checked-in DDL result preserves some indentation in echoed SQL.
+        expected = '\n'.join(line.strip() for line in expected.splitlines()) + '\n'
+        actual = '\n'.join(line.strip() for line in actual.splitlines()) + '\n'
     if actual != expected:
         print(''.join(difflib.unified_diff(expected.splitlines(True), actual.splitlines(True),
                                          fromfile='expected', tofile='actual')))
@@ -135,7 +150,7 @@ def run_suite(connection, root, suite, case, fixtures, mock_port):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--port', type=int, required=True)
-    parser.add_argument('--suite', choices=['file_sql', 'ai_function', 'both'], default='both')
+    parser.add_argument('--suite', choices=['file_sql', 'ai_function', 'ai_column_ddl', 'both'], default='both')
     parser.add_argument('--mock-port', type=int, default=19130)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
@@ -163,6 +178,8 @@ def main():
                     run_suite(conn, root, 'file_sql', 'file_sql_basic', fixtures, args.mock_port)
                 if args.suite in ('ai_function', 'both'):
                     run_suite(conn, root, 'ai_function', 'ai_function_enhancement', fixtures, args.mock_port)
+                if args.suite == 'ai_column_ddl':
+                    run_suite(conn, root, 'ai_column', 'ai_column_ddl', fixtures, args.mock_port)
     finally:
         mock.shutdown()
         mock.server_close()

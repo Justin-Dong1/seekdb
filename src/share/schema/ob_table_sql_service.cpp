@@ -21,6 +21,7 @@
 #include "share/schema/ob_constraint.h"
 #include "share/schema/ob_partition_sql_helper.h"
 #include "share/ob_timezone_mgr.h"
+#include "common/json_type/ob_json_tree.h"
 
 namespace oceanbase
 {
@@ -29,6 +30,10 @@ namespace share
 {
 namespace schema
 {
+namespace {
+int persist_ai_column_definitions(ObISQLClient &client, const ObTableSchema &table,
+                                  uint64_t only_column_id = OB_INVALID_ID);
+}
 
 int ObTableSqlService::exec_update(
     ObISQLClient &sql_client,
@@ -889,6 +894,9 @@ int ObTableSqlService::insert_single_column(
   if (OB_FAIL(check_ddl_allowed(new_table_schema))) {
   } else if (OB_FAIL(add_single_column(sql_client, new_column_schema))) {
   }
+  if (OB_SUCC(ret) && new_column_schema.is_ai_column()) {
+    ret = persist_ai_column_definitions(sql_client, new_table_schema, new_column_schema.get_column_id());
+  }
   if (OB_SUCC(ret)) {
     if (new_column_schema.is_autoincrement()) {
       if (OB_FAIL(add_sequence(sql_client,
@@ -1115,6 +1123,71 @@ int ObTableSqlService::add_columns_dml(
   return ret;
 }
 
+namespace {
+int persist_ai_column_definitions(ObISQLClient &client, const ObTableSchema &table,
+                                  uint64_t only_column_id)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < table.get_column_count(); ++i) {
+    const ObColumnSchemaV2 *column = table.get_column_schema_by_idx(i);
+    if (column == nullptr || !column->is_ai_column()
+        || (only_column_id != OB_INVALID_ID && column->get_column_id() != only_column_id)) {
+      continue;
+    }
+    ObArenaAllocator allocator("AiColumnDDL");
+    ObIJsonBase *spec = nullptr;
+    ObIJsonBase *expression = nullptr;
+    ObIJsonBase *model = nullptr;
+    ObIJsonBase *retries = nullptr;
+    ObIJsonBase *dependencies = nullptr;
+    ObJsonBuffer dependency_text(&allocator);
+    uint64_t hidden_ids[3] = {};
+    const char *suffixes[] = {"state", "request", "result_spec"};
+    if (OB_FAIL(ObJsonBaseFactory::get_json_base(&allocator, column->get_ai_column_spec(),
+        ObJsonInType::JSON_TREE, ObJsonInType::JSON_TREE, spec))) {
+    } else if (OB_FAIL(spec->get_object_value("expression", expression))) {
+    } else if (OB_FAIL(spec->get_object_value("model", model))) {
+    } else if (OB_FAIL(spec->get_object_value("max_retries", retries))) {
+    } else if (OB_FAIL(spec->get_object_value("dependencies", dependencies))) {
+    } else if (OB_FAIL(dependencies->print(dependency_text, false))) {
+    }
+    for (int k = 0; OB_SUCC(ret) && k < 3; ++k) {
+      ObSqlString name;
+      if (OB_FAIL(name.append_fmt("__ai_%lu_%s", column->get_column_id(), suffixes[k]))) {
+      } else {
+        const ObColumnSchemaV2 *hidden = table.get_column_schema(name.string());
+        if (hidden == nullptr || !hidden->is_hidden()) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          hidden_ids[k] = hidden->get_column_id();
+        }
+      }
+    }
+    ObDMLSqlSplicer dml;
+    ObDMLExecHelper exec(client);
+    int64_t affected = 0;
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(dml.add_pk_column("table_id", table.get_table_id()))) {
+    } else if (OB_FAIL(dml.add_pk_column("column_id", column->get_column_id()))) {
+    } else if (OB_FAIL(dml.add_column("schema_version", table.get_schema_version()))) {
+    } else if (OB_FAIL(dml.add_column("column_name", ObHexEscapeSqlStr(column->get_column_name_str())))) {
+    } else if (OB_FAIL(dml.add_column("normalized_expr", ObHexEscapeSqlStr(column->get_ai_column_spec())))) {
+    } else if (OB_FAIL(dml.add_column("dependency_column_ids", ObHexEscapeSqlStr(dependency_text.string())))) {
+    } else if (OB_FAIL(dml.add_column("model_name", ObHexEscapeSqlStr(
+        ObString(static_cast<int32_t>(model->get_data_length()), model->get_data()))))) {
+    } else if (OB_FAIL(dml.add_column("sync_mode", "async"))) {
+    } else if (OB_FAIL(dml.add_column("max_retries", retries->get_int()))) {
+    } else if (OB_FAIL(dml.add_column("state_column_id", hidden_ids[0]))) {
+    } else if (OB_FAIL(dml.add_column("request_column_id", hidden_ids[1]))) {
+    } else if (OB_FAIL(dml.add_column("result_spec_column_id", hidden_ids[2]))) {
+    } else if (OB_FAIL(dml.add_column("result_spec", ObHexEscapeSqlStr(column->get_ai_column_spec())))) {
+    } else if (OB_FAIL(exec.exec_insert(OB_ALL_AI_COLUMN_TNAME, dml, affected))) {
+    }
+  }
+  return ret;
+}
+} // namespace
+
 int ObTableSqlService::batch_add_columns_for_create_table(common::ObISQLClient &sql_client,
     const ObIArray<ObTableSchema> &tables)
 {
@@ -1142,6 +1215,9 @@ int ObTableSqlService::batch_add_columns_for_create_table(common::ObISQLClient &
     } else if (OB_FAIL(dml.set_default_columns("is_deleted", "0"))) {
     } else if (OB_FAIL(exec_dml(sql_client, OB_ALL_COLUMN_HISTORY_TNAME, dml, column_count))) {
     } else if (FALSE_IT(time_guard.click("insert_all_column_history"))) {
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < tables.count(); ++i) {
+      ret = persist_ai_column_definitions(sql_client, tables.at(i));
     }
   }
   return ret;
@@ -2683,7 +2759,17 @@ int ObTableSqlService::delete_from_all_table(
     const uint64_t table_id)
 {
   int ret = OB_SUCCESS;
-  if (!is_core_table(table_id)) {
+  if (!is_inner_table(table_id)) {
+    const char *ai_tables[] = {OB_ALL_AI_COLUMN_TASK_TNAME, OB_ALL_AI_COLUMN_TNAME};
+    for (int i = 0; OB_SUCC(ret) && i < 2; ++i) {
+      ObSqlString cleanup;
+      int64_t affected = 0;
+      if (OB_FAIL(cleanup.append_fmt("DELETE FROM %s WHERE table_id=%lu", ai_tables[i], table_id))) {
+      } else if (OB_FAIL(sql_client.write(cleanup.ptr(), affected))) {
+      }
+    }
+  }
+  if (OB_SUCC(ret) && !is_core_table(table_id)) {
     ObDMLSqlSplicer dml;
     if (OB_FAIL(dml.add_pk_column("table_id", ObSchemaUtils::get_extract_schema_id(
                                                  table_id)))) {
@@ -3218,6 +3304,7 @@ int ObTableSqlService::gen_column_dml_without_check(
                          || (OB_FAIL(dml.add_column("skip_index_attr", column.get_skip_index_attr().get_packed_value())))
                          || (OB_FAIL(dml.add_column("lob_chunk_size", column.get_lob_chunk_size())))
                          || (OB_FAIL(dml.add_column("local_session_vars", ObHexEscapeSqlStr(local_session_var))))
+                         || OB_FAIL(dml.add_column("ai_column_spec", ObHexEscapeSqlStr(column.get_ai_column_spec())))
                          || OB_FAIL(dml.add_gmt_create())
                          || OB_FAIL(dml.add_gmt_modified()))) {
     }

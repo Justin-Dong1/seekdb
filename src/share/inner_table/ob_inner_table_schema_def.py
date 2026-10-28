@@ -342,7 +342,8 @@ all_column_def = dict(
       ('sub_data_type', 'int', 'false', '0'),
       ('skip_index_attr', 'int', 'false', '0'),
       ('lob_chunk_size', 'int', 'false', 'OB_DEFAULT_LOB_CHUNK_SIZE'),
-      ('local_session_vars', 'longtext', 'true')
+      ('local_session_vars', 'longtext', 'true'),
+      ('ai_column_spec', 'longtext', 'true')
   ]
   )
 
@@ -2467,6 +2468,67 @@ all_objauth_mysql_def = dict(
 def_table_schema(**all_objauth_mysql_def)
 def_table_schema(**gen_history_table_def(1134, all_objauth_mysql_def))
 
+# AI column definitions belong to the same DDL transaction as their table.
+# Keep them separate from model endpoints: definitions must never contain keys.
+all_ai_column_def = dict(
+    owner = 'database-competition',
+    table_name = '__all_ai_column',
+    table_id = '1135',
+    table_type = 'SYSTEM_TABLE',
+    gm_columns = ['gmt_create', 'gmt_modified'],
+    rowkey_columns = [('table_id', 'int'), ('column_id', 'int')],
+    is_cluster_private = False,
+    meta_record_in_sys = False,
+    normal_columns = [
+        ('schema_version', 'int', 'false'),
+        ('column_name', 'varchar:OB_MAX_COLUMN_NAME_LENGTH', 'false'),
+        ('normalized_expr', 'longtext', 'false'),
+        ('dependency_column_ids', 'longtext', 'false'),
+        ('model_name', 'varchar:128', 'false'),
+        ('sync_mode', 'varchar:16', 'false', 'async'),
+        ('max_retries', 'int', 'false', '0'),
+        ('state_column_id', 'int', 'false'),
+        ('request_column_id', 'int', 'false'),
+        ('result_spec_column_id', 'int', 'false'),
+        ('result_spec', 'longtext', 'false'),
+    ]
+)
+def_table_schema(**all_ai_column_def)
+
+# Enqueue and invalidation are part of the user's transaction. The worker sees
+# committed rows only. request_id identifies one atomic result group; task_id
+# identifies a single column invocation within that group.
+all_ai_column_task_def = dict(
+    owner = 'database-competition',
+    table_name = '__all_ai_column_task',
+    table_id = '1136',
+    table_type = 'SYSTEM_TABLE',
+    gm_columns = ['gmt_create', 'gmt_modified'],
+    rowkey_columns = [('task_id', 'varchar:36')],
+    is_cluster_private = False,
+    meta_record_in_sys = False,
+    normal_columns = [
+        ('table_id', 'int', 'false'),
+        ('column_id', 'int', 'false'),
+        ('schema_version', 'int', 'false'),
+        ('request_id', 'varchar:36', 'false'),
+        ('rowkey_predicate', 'longtext', 'false'),
+        ('request_payload', 'longtext', 'false'),
+        ('result_spec', 'longtext', 'false'),
+        ('state', 'int', 'false', '0'),
+        ('retry_count', 'int', 'false', '0'),
+        ('max_retries', 'int', 'false', '0'),
+        ('eligible_ts', 'timestamp:6', 'false'),
+        ('lease_token', 'varchar:36', 'true'),
+        ('lease_expires_ts', 'timestamp:6', 'true'),
+        ('last_error_code', 'int', 'false', '0'),
+        ('result_value', 'longtext', 'true'),
+    ]
+)
+def_table_schema(**all_ai_column_task_def)
+
+# 1135: __all_ai_column
+# 1136: __all_ai_column_task
 
 # Reserved position (placeholder before this line)
 # Placeholder suggestion for this section: Use actual table names for placeholders
@@ -14416,6 +14478,33 @@ def_sys_index_table(
   index_type = 'INDEX_TYPE_NORMAL_LOCAL',
   keywords = all_def_keywords['__all_objauth_mysql'])
 
+def_sys_index_table(
+  index_name = 'idx_ai_column_task_eligible',
+  index_table_id = 102060,
+  index_columns = ['state', 'eligible_ts'],
+  index_using_type = 'USING_BTREE',
+  index_type = 'INDEX_TYPE_NORMAL_LOCAL',
+  keywords = all_def_keywords['__all_ai_column_task'])
+
+def_sys_index_table(
+  index_name = 'idx_ai_column_task_request',
+  index_table_id = 102061,
+  index_columns = ['request_id'],
+  index_using_type = 'USING_BTREE',
+  index_type = 'INDEX_TYPE_NORMAL_LOCAL',
+  keywords = all_def_keywords['__all_ai_column_task'])
+
+def_sys_index_table(
+  index_name = 'idx_ai_column_task_column',
+  index_table_id = 102062,
+  index_columns = ['table_id', 'column_id'],
+  index_using_type = 'USING_BTREE',
+  index_type = 'INDEX_TYPE_NORMAL_LOCAL',
+  keywords = all_def_keywords['__all_ai_column_task'])
+
+# 102060: idx_ai_column_task_eligible
+# 102061: idx_ai_column_task_request
+# 102062: idx_ai_column_task_column
 
 # Reserved position (placeholder before this line)
 # Index table placeholder suggestion: based on the base table (data table) name for placeholder, other methods include: index name (index_name), index table name

@@ -7824,7 +7824,31 @@ int ObDDLService::add_new_column_to_table_schema(
       ret = OB_ERR_UNEXPECTED;
     } else {
       alter_column_schema.set_prev_column_id(mem_col->get_prev_column_id());
-      if (update_inner_table) {
+      if (alter_column_schema.is_ai_column()) {
+        const char *suffixes[] = {"state", "request", "result_spec"};
+        for (int k = 0; OB_SUCC(ret) && k < 3; ++k) {
+          AlterColumnSchema hidden;
+          ObSqlString name;
+          hidden.alter_type_ = OB_DDL_ADD_COLUMN;
+          hidden.set_column_id(new_table_schema.get_max_used_column_id() + 1);
+          new_table_schema.set_max_used_column_id(hidden.get_column_id());
+          hidden.set_table_id(new_table_schema.get_table_id());
+          hidden.set_is_hidden(true);
+          hidden.set_nullable(true);
+          hidden.set_data_type(k == 0 ? ObIntType : ObVarcharType);
+          hidden.set_charset_type(k == 0 ? CHARSET_BINARY : CHARSET_UTF8MB4);
+          hidden.set_collation_type(k == 0 ? CS_TYPE_BINARY : CS_TYPE_UTF8MB4_BIN);
+          if (k != 0) { hidden.set_data_length(k == 1 ? 36 : 4096); }
+          if (OB_FAIL(name.append_fmt("__ai_%lu_%s", alter_column_schema.get_column_id(), suffixes[k]))) {
+          } else if (OB_FAIL(hidden.set_column_name(name.string()))) {
+          } else if (OB_FAIL(update_prev_id_and_add_column_(origin_table_schema,
+                         new_table_schema, hidden, ddl_operator, trans))) {
+          } else if (update_inner_table && OB_FAIL(ddl_operator->insert_single_column(
+                         *trans, new_table_schema, hidden))) {
+          }
+        }
+      }
+      if (OB_SUCC(ret) && update_inner_table) {
         if (OB_FAIL(ddl_operator->insert_single_column(*trans,
                 new_table_schema, alter_column_schema))) {
         }
