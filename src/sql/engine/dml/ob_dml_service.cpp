@@ -609,7 +609,8 @@ int append_ai_hex_literal(ObSqlString &sql, const ObString &value)
 
 // Execute through the DML operator's external-session connection so the task
 // shares the user's transaction and statement rollback boundary.
-int maintain_ai_tasks(const ObDMLBaseCtDef &ctdef, ObTableModifyOp &op, bool deleting)
+int maintain_ai_tasks(const ObDMLBaseCtDef &ctdef, ObTableModifyOp &op, bool deleting,
+                      const ObUpdCtDef *update = nullptr)
 {
   int ret = OB_SUCCESS;
   if (is_inner_table(ctdef.das_base_ctdef_.index_tid_)) { return ret; }
@@ -626,6 +627,20 @@ int maintain_ai_tasks(const ObDMLBaseCtDef &ctdef, ObTableModifyOp &op, bool del
     has_ai |= table->get_column_schema_by_idx(i)->is_ai_column();
   }
   if (OB_FAIL(ret) || !has_ai) { return ret; }
+  ObSqlString column_filter;
+  if (update != nullptr) {
+    int64_t affected = 0;
+    for (int64_t i = 0; OB_SUCC(ret) && i < update->assign_columns_.count(); ++i) {
+      const auto &assignment = update->assign_columns_.at(i);
+      const auto *column = table->get_column_schema(assignment.column_name_);
+      if (column != nullptr && column->is_ai_column() && assignment.is_implicit_) {
+        OZ(column_filter.append_fmt("%s%lu", affected++ == 0 ? " AND column_id IN (" : ",",
+                                    column->get_column_id()));
+      }
+    }
+    if (affected == 0 || OB_FAIL(ret)) { return ret; }
+    OZ(column_filter.append(")"));
+  }
   if (ctdef.das_base_ctdef_.is_ignore_ || ctdef.is_table_without_pk_) {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI COLUMN insert without an explicit primary key or with IGNORE");
@@ -644,7 +659,7 @@ int maintain_ai_tasks(const ObDMLBaseCtDef &ctdef, ObTableModifyOp &op, bool del
       ret = OB_ERR_UNEXPECTED;
     } else if (column->is_ai_column()) {
       // An AI result is unavailable until the committed task is completed.
-      if (!deleting) {
+      if (!deleting && update == nullptr) {
         row.at(i)->locate_datum_for_write(op.get_eval_ctx()).set_null();
         row.at(i)->get_eval_info(op.get_eval_ctx()).evaluated_ = true;
       }
@@ -692,6 +707,7 @@ int maintain_ai_tasks(const ObDMLBaseCtDef &ctdef, ObTableModifyOp &op, bool del
   OZ(sql.append_fmt(",result_spec,max_retries,now(6) FROM oceanbase.__all_ai_column WHERE table_id=%lu",
                    table->get_table_id()));
   }
+  OZ(sql.append(column_filter.string()));
   bool nested = false;
   // The cascade marker is the existing DML nested-write transaction guard:
   // it prevents the inner INSERT from ending/committing the outer statement.
@@ -951,6 +967,13 @@ int ObDMLService::process_update_row(const ObUpdCtDef &upd_ctdef,
   if (OB_FAIL(ret)) {
   } else if (!is_skipped && upd_rtdef.has_table_cycle_) {
     ret = OB_ERR_ROW_IS_REFERENCED;
+  }
+
+  if (OB_SUCC(ret) && !is_skipped && upd_rtdef.is_row_changed_ && upd_ctdef.is_primary_index_) {
+    if (OB_FAIL(maintain_ai_tasks(upd_ctdef, dml_op, true, &upd_ctdef))) {
+    } else {
+      ret = maintain_ai_tasks(upd_ctdef, dml_op, false, &upd_ctdef);
+    }
   }
 
   if (OB_SUCC(ret) && !is_skipped) {

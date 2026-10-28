@@ -24,6 +24,7 @@
 #include "sql/parser/parse_malloc.h"
 #include "query/vector/ob_vector_index_util.h"
 #include "sql/das/ob_domain_id.h"
+#include "common/json_type/ob_json_tree.h"
 
 namespace oceanbase
 {
@@ -481,6 +482,33 @@ int ObDelUpdResolver::check_update_vector_col_with_vector_index(const ObTableSch
   return ret;
 }
 
+namespace {
+int ai_assignment_invalidated(const ObColumnSchemaV2 &column, const ObTableSchema &table,
+                              const ObIArray<ObAssignment> &assignments, bool &invalidated)
+{
+  int ret = OB_SUCCESS;
+  invalidated = false;
+  if (!column.is_ai_column()) { return ret; }
+  ObArenaAllocator allocator("AiAssignment");
+  ObIJsonBase *spec = nullptr, *dependencies = nullptr;
+  OZ(ObJsonBaseFactory::get_json_base(&allocator, column.get_ai_column_spec(),
+      ObJsonInType::JSON_TREE, ObJsonInType::JSON_TREE, spec));
+  OZ(spec->get_object_value("dependencies", dependencies));
+  for (int64_t i = 0; OB_SUCC(ret) && !invalidated && i < assignments.count(); ++i) {
+    if (assignments.at(i).is_implicit_) { continue; }
+    const auto *changed = table.get_column_schema(assignments.at(i).column_expr_->get_column_id());
+    if (changed == nullptr) { ret = OB_ERR_UNEXPECTED; }
+    else if (changed->is_rowkey_column()) { invalidated = true; }
+    for (uint64_t j = 0; OB_SUCC(ret) && !invalidated && j < dependencies->element_count(); ++j) {
+      ObIJsonBase *dependency = nullptr;
+      OZ(dependencies->get_array_element(j, dependency));
+      if (OB_SUCC(ret)) { invalidated = dependency->get_int() == changed->get_column_id(); }
+    }
+  }
+  return ret;
+}
+}
+
 int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment> &assigns,
                                                      const ObStmtScope scope)
 {
@@ -523,18 +551,21 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
         ColumnItem *col_item = NULL;
         ObColumnSchemaV2 *column_schema = *iter;
         bool need_assigned = false;
+        bool ai_invalidated = false;
         uint64_t column_id = OB_INVALID_ID;
         if (NULL == column_schema) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("get column schema fail", K(column_schema));
         } else if (FALSE_IT(column_id = column_schema->get_column_id())) {
           //do nothing
+        } else if (OB_FAIL(ai_assignment_invalidated(*column_schema, *table_schema,
+                                                    assigns.at(i).assignments_, ai_invalidated))) {
         } else if (OB_FAIL(check_need_assignment(assigns.at(i).assignments_,
                                                  table_item->table_id_,
                                                  trigger_exist,
                                                  *column_schema,
                                                  need_assigned))) {
-        } else if (FALSE_IT(need_assigned = need_assigned || 
+        } else if (FALSE_IT(need_assigned = need_assigned || ai_invalidated ||
                                             ((column_schema->is_vec_hnsw_vid_column() ||
                                               column_schema->is_vec_ivf_center_id_column()) && 
                                              (update_with_vector_index || T_INSERT_SCOPE == scope)))) {
@@ -553,7 +584,9 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
           } else {
             assignment.column_expr_ = col_item->expr_;
             assignment.is_implicit_ = true;
-            if (column_schema->is_on_update_current_timestamp()) {
+            if (ai_invalidated) {
+              ret = ObRawExprUtils::build_null_expr(*params_.expr_factory_, assignment.expr_);
+            } else if (column_schema->is_on_update_current_timestamp()) {
               assignment.column_expr_->set_result_flag(ON_UPDATE_NOW_FLAG);
               ObDefaultValueUtils utils(stmt, &params_, this);
               if (OB_FAIL(utils.build_now_expr(col_item, assignment.expr_))) {

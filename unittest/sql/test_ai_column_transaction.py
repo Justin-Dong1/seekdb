@@ -15,7 +15,7 @@ def main():
             cur.execute('USE ai_column_transaction_test')
             cur.execute('DROP TABLE IF EXISTS docs')
             cur.execute("""CREATE TABLE docs (
-                id BIGINT PRIMARY KEY, content VARCHAR(200),
+                id BIGINT PRIMARY KEY, content VARCHAR(200), title INT DEFAULT 0,
                 tags JSON AI COLUMN(AI_COMPLETE('transaction_mock', content)),
                 summary VARCHAR(200) AI COLUMN(AI_COMPLETE('transaction_mock', content)))""")
             cur.execute("""SELECT t.table_id FROM oceanbase.__all_table t
@@ -41,7 +41,7 @@ def main():
                         (table_id,))
             snapshot_sql = cur.fetchone()[0]
             cur.execute(snapshot_sql)
-            assert cur.fetchone() == (1, "quote' and `identifier`"), 'snapshot preserves SQL quoting'
+            assert cur.fetchone() == (1, "quote' and `identifier`", 0), 'snapshot preserves SQL quoting'
             writer.rollback()
             assert count(cur) == 0 and count(other) == 0, 'rollback must remove tasks'
             cur.execute('SELECT COUNT(*) FROM docs')
@@ -64,17 +64,46 @@ def main():
             assert count(other) == 4, 'failed statement must leave no orphan tasks'
             cur.execute('SELECT COUNT(*) FROM docs WHERE id=4')
             assert cur.fetchone()[0] == 0
+            cur.execute("UPDATE docs SET tags=JSON_OBJECT('ready',true), summary='ready' WHERE id=2")
+            cur.execute('UPDATE docs SET title=1 WHERE id=2')
+            cur.execute("SELECT tags IS NOT NULL AND summary='ready' FROM docs WHERE id=2")
+            assert cur.fetchone()[0] == 1, 'unrelated update preserves AI results'
             writer.begin()
-            cur.execute('DELETE FROM docs WHERE id=2')
+            cur.execute("UPDATE docs SET content='changed' WHERE id=2")
+            cur.execute('SELECT tags IS NULL AND summary IS NULL FROM docs WHERE id=2')
+            assert cur.fetchone()[0] == 1, 'dependency update invalidates both results'
+            assert count(cur) == 4, 'update replaces old tasks instead of duplicating them'
+            writer.rollback()
+            cur.execute("SELECT content='second' AND summary='ready' FROM docs WHERE id=2")
+            assert cur.fetchone()[0] == 1, 'update rollback restores results and source'
+            cur.execute('UPDATE docs SET id=20 WHERE id=2')
+            cur.execute('SELECT tags IS NULL AND summary IS NULL FROM docs WHERE id=20')
+            assert cur.fetchone()[0] == 1, 'primary key update invalidates AI results'
+            cur.execute("SELECT COUNT(*) FROM oceanbase.__all_ai_column_task WHERE table_id=%s AND rowkey_predicate='`id` = 20'",
+                        (table_id,))
+            assert cur.fetchone()[0] == 2, 'tasks use new primary key'
+            writer.begin()
+            cur.execute('DELETE FROM docs WHERE id=20')
             assert count(cur) == 2, 'delete removes pending tasks in its own transaction'
             assert count(other) == 4, 'uncommitted delete must not remove visible tasks'
             writer.rollback()
             assert count(cur) == 4, 'delete rollback restores pending tasks'
-            cur.execute('DELETE FROM docs WHERE id=2')
+            cur.execute('DELETE FROM docs WHERE id=20')
             assert count(other) == 2, 'committed delete removes only its row tasks'
             cur.execute('DROP TABLE docs')
             assert count(other) == 0
-    print('PASS AI column transactions: visibility, rollback, batch grouping, duplicate rollback, delete, cleanup')
+            cur.execute('DROP TABLE IF EXISTS separate_dependencies')
+            cur.execute("""CREATE TABLE separate_dependencies(
+                id BIGINT PRIMARY KEY, a VARCHAR(40), b VARCHAR(40),
+                x VARCHAR(40) AI COLUMN(AI_COMPLETE('transaction_mock', a)),
+                y VARCHAR(40) AI COLUMN(AI_COMPLETE('transaction_mock', b)))""")
+            cur.execute("INSERT INTO separate_dependencies(id,a,b) VALUES(1,'a','b')")
+            cur.execute("UPDATE separate_dependencies SET x='ready-a',y='ready-b' WHERE id=1")
+            cur.execute("UPDATE separate_dependencies SET a='new-a' WHERE id=1")
+            cur.execute("SELECT x IS NULL, y='ready-b' FROM separate_dependencies WHERE id=1")
+            assert cur.fetchone() == (1, 1), 'only dependent AI columns are invalidated'
+            cur.execute('DROP TABLE separate_dependencies')
+    print('PASS AI column transactions: visibility, rollback, batching, duplicate rollback, selective update, primary key update, delete, cleanup')
 
 
 if __name__ == '__main__':
