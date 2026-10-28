@@ -63,14 +63,15 @@ eval select id, name, score
        from read_csv('$FILE_SQL_DATA_DIR/export.csv')
       order by id;
 
---echo # forced nested-loop rescans preserve every match
 --echo # inferred timestamp precision preserves whole and fractional seconds
 eval copy (select '2026-08-01 10:11:12' as whole_seconds,
-                  '2026-08-01 10:11:12.123456' as fractional_seconds)
+                  '2026-08-01 10:11:12.123456' as fractional_seconds,
+                  NULL as missing_value)
        to '$FILE_SQL_DATA_DIR/time-precision.csv' (format csv,header);
-eval select whole_seconds,fractional_seconds
+eval select whole_seconds,fractional_seconds,missing_value is null as default_null_roundtrip
        from read_csv('$FILE_SQL_DATA_DIR/time-precision.csv');
 
+--echo # forced nested-loop rescans preserve every match
 eval select /*+ LEADING(c j) USE_NL(j) NO_USE_NL_MATERIALIZATION(j) */
              c.id as left_id,j.id as right_id
         from read_csv('$FILE_SQL_DATA_DIR/basic.csv') c

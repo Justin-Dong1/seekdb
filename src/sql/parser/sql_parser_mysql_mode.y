@@ -372,7 +372,7 @@ END_P SET_VAR DELIMITER
         ORGANIZATION
 //-----------------------------non_reserved keyword end---------------------------------------------
 %type <node> sql_stmt stmt_list stmt opt_end_p
-%type <node> select_stmt copy_stmt update_stmt delete_stmt
+%type <node> select_stmt copy_stmt opt_copy_nullstr update_stmt delete_stmt
 %type <node> insert_stmt single_table_insert values_clause dml_table_name
 %type <node> create_table_stmt create_table_like_stmt fork_table_stmt fork_database_stmt diff_table_stmt merge_table_stmt opt_table_option_list table_option_list table_option table_option_list_space_seperated parallel_option lob_storage_clause lob_storage_parameter lob_storage_parameters lob_chunk_size
 %type <node> index_or_heap
@@ -8460,7 +8460,7 @@ select_no_parens opt_when
 // Reuse the mature SELECT INTO OUTFILE resolver and execution path.
 copy_stmt:
 COPY '(' select_no_parens ')' TO STRING_VALUE
-  '(' FORMAT CSV ',' HEADER ',' NULLSTR STRING_VALUE ')'
+  '(' FORMAT CSV ',' HEADER opt_copy_nullstr ')'
 {
   ParseNode *format_value = NULL;
   ParseNode *format_option = NULL;
@@ -8483,7 +8483,7 @@ COPY '(' select_no_parens ')' TO STRING_VALUE
   malloc_non_terminal_node(header_option, result->malloc_pool_,
                            T_PARSE_HEADER, 1, header_value);
 
-  malloc_non_terminal_node(null_list, result->malloc_pool_, T_EXPR_LIST, 1, $14);
+  malloc_non_terminal_node(null_list, result->malloc_pool_, T_EXPR_LIST, 1, $12);
   malloc_non_terminal_node(null_option, result->malloc_pool_,
                            T_NULL_IF_EXETERNAL, 1, null_list);
   malloc_non_terminal_node(options, result->malloc_pool_, T_LINK_NODE, 2,
@@ -8526,6 +8526,20 @@ COPY '(' select_no_parens ')' TO STRING_VALUE
   } else {
     $$->children_[PARSE_SELECT_INTO_EXTRA] = into_node;
   }
+}
+;
+
+opt_copy_nullstr:
+',' NULLSTR STRING_VALUE
+{
+  $$ = $3;
+}
+| /* empty */
+{
+  /* DuckDB CSV uses an empty field for NULL unless NULLSTR is supplied. */
+  malloc_terminal_node($$, result->malloc_pool_, T_VARCHAR);
+  $$->str_value_ = "";
+  $$->str_len_ = 0;
 }
 ;
 

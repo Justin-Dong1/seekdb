@@ -38,10 +38,10 @@ id	name	score
 1	Alice	98.5
 2	Bob	87
 3	Chen	90.25
-# forced nested-loop rescans preserve every match
 # inferred timestamp precision preserves whole and fractional seconds
-whole_seconds	fractional_seconds
-2026-08-01 10:11:12	2026-08-01 10:11:12.123456
+whole_seconds	fractional_seconds	default_null_roundtrip
+2026-08-01 10:11:12	2026-08-01 10:11:12.123456	1
+# forced nested-loop rescans preserve every match
 left_id	right_id
 1	1
 2	2
