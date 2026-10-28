@@ -164,6 +164,7 @@ static const NonReservedKeyword Mysql_none_reserved_keywords[] =
   {"connect", CONNECT},
   {"convert", CONVERT},
   {"copy", COPY},
+  {"csv", CSV},
   {"cosine", COSINE},
   {"count", COUNT},
   {"cpu", CPU},
@@ -325,6 +326,7 @@ static const NonReservedKeyword Mysql_none_reserved_keywords[] =
   {"group_concat", GROUP_CONCAT},
   {"having", HAVING},
   {"hash", HASH},
+  {"header", HEADER},
   {"heap", HEAP},
   {"help", HELP},
   {"high_priority", HIGH_PRIORITY},
@@ -546,6 +548,7 @@ static const NonReservedKeyword Mysql_none_reserved_keywords[] =
   {"nowait", NOWAIT},
   {"nulls", NULLS},
   {"null_if", NULL_IF_EXETERNAL},
+  {"nullstr", NULLSTR},
   {"numeric", DECIMAL},
   {"number", NUMBER},
   {"nvarchar", NVARCHAR},
@@ -958,6 +961,14 @@ static const NonReservedKeyword Mysql_none_reserved_keywords[] =
   {"INCONSISTENT", INCONSISTENT},
   {"INDIVIDUAL", INDIVIDUAL},
   {"hybrid_search", HYBRID_SEARCH},
+  {"file_scan", FILE_SCAN},
+  {"file_list", FILE_LIST},
+  {"file_schema", FILE_SCHEMA},
+  {"read_csv", READ_CSV},
+  {"read_json", READ_JSON},
+  {"read_ndjson", READ_NDJSON},
+  {"read_parquet", READ_PARQUET},
+  {"glob", GLOB},
 };
 
 /** https://dev.mysql.com/doc/refman/5.7/en/sql-syntax-prepared-statements.html

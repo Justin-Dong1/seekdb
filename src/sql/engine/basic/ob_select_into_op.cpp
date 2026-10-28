@@ -17,9 +17,12 @@
 #define USING_LOG_PREFIX SQL_ENG
 
 #include <cmath>
+#include <cerrno>
+#include <cstdio>
 #include <memory>
 
 #include "ob_select_into_op.h"
+#include "sql/engine/basic/ob_file_scan_utils.h"
 #include "sql/engine/cmd/ob_variable_set_executor.h"
 #include "lib/charset/ob_charset_string_helper.h"
 #include "sql/engine/px/ob_px_sqc_handler.h"
@@ -36,7 +39,8 @@ namespace sql
 
 OB_SERIALIZE_MEMBER(ObSelectIntoOpInput, task_id_, sqc_id_);
 OB_SERIALIZE_MEMBER((ObSelectIntoSpec, ObOpSpec), into_type_, user_vars_, outfile_name_,
-    field_str_, line_str_, closed_cht_, is_optional_, select_exprs_, is_single_, max_file_size_,
+    field_str_, line_str_, closed_cht_, is_optional_, select_exprs_, select_column_names_,
+    is_single_, max_file_size_,
     escaped_cht_, cs_type_, parallel_, buffer_size_, is_overwrite_,
     external_properties_);
 
@@ -200,6 +204,14 @@ int ObSelectIntoOp::inner_get_next_row()
       && T_INTO_VARIABLES != into_type
       && OB_FAIL(create_the_only_data_writer(data_writer))) {
   }
+  if (OB_SUCC(ret) && T_INTO_OUTFILE == into_type
+      && external_properties_.csv_format_.parse_header_ && !header_written_) {
+    ObCsvFileWriter *csv_writer = static_cast<ObCsvFileWriter *>(data_writer);
+    if (OB_ISNULL(csv_writer)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(write_csv_header(*csv_writer))) {
+    }
+  }
   while (OB_SUCC(ret) && row_count < top_limit_cnt_) {
     clear_evaluated_flag();
     if (OB_FAIL(child_->get_next_row())) {
@@ -253,6 +265,14 @@ int ObSelectIntoOp::inner_get_next_batch(const int64_t max_row_cnt)
     if (OB_FAIL(create_the_only_data_writer(data_writer))) {
     } else if (OB_ISNULL(data_writer)) {
       ret = OB_ERR_UNEXPECTED;
+    }
+  }
+  if (OB_SUCC(ret) && T_INTO_OUTFILE == into_type
+      && external_properties_.csv_format_.parse_header_ && !header_written_) {
+    ObCsvFileWriter *csv_writer = static_cast<ObCsvFileWriter *>(data_writer);
+    if (OB_ISNULL(csv_writer)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(write_csv_header(*csv_writer))) {
     }
   }
 
@@ -325,7 +345,24 @@ int ObSelectIntoOp::inner_rescan()
 int ObSelectIntoOp::inner_close()
 {
   int ret = OB_SUCCESS;
-  if (OB_NOT_NULL(data_writer_) && OB_FAIL(data_writer_->close_data_writer())) {
+  if (OB_NOT_NULL(data_writer_)) {
+    const bool created_file = data_writer_->is_file_opened_;
+    if (need_commit_) {
+      ret = data_writer_->close_data_writer();
+    }
+    if (!need_commit_ || OB_SUCCESS != ret) {
+      // Only remove a file this writer successfully created. An existing-file
+      // open failure must leave the previous file intact.
+      data_writer_->file_appender_.close();
+      data_writer_->is_file_opened_ = false;
+      if (created_file) {
+        const std::string filename(data_writer_->url_.ptr(), data_writer_->url_.length());
+        if (0 != std::remove(filename.c_str()) && ENOENT != errno) {
+          if (OB_SUCCESS == ret) ret = OB_IO_ERROR;
+          LOG_WARN("failed to remove incomplete outfile", K(ret), "filename", filename.c_str());
+        }
+      }
+    }
   }
   return ret;
 }
@@ -932,13 +969,43 @@ int ObSelectIntoOp::print_field(const ObObj &obj, ObCsvFileWriter &data_writer)
   if (!has_escape_) {
     OZ(write_obj_to_file(obj, data_writer, false));
   } else if (obj.is_null()) {
-    OZ(write_single_char_to_file(&char_escape_, data_writer));
-    OZ(write_single_char_to_file(&char_n, data_writer));
+    if (!external_properties_.csv_format_.null_if_.empty()) {
+      ObObj null_value;
+      null_value.set_varchar(external_properties_.csv_format_.null_if_.at(0));
+      null_value.set_collation_type(cs_type_);
+      OZ(write_obj_to_file(null_value, data_writer, false));
+    } else {
+      OZ(write_single_char_to_file(&char_escape_, data_writer));
+      OZ(write_single_char_to_file(&char_n, data_writer));
+    }
   } else {
     OZ(write_obj_to_file(obj, data_writer, true));
   }
   if (need_enclose) {
     OZ(write_single_char_to_file(&char_enclose_, data_writer));
+  }
+  return ret;
+}
+
+int ObSelectIntoOp::write_csv_header(ObCsvFileWriter &data_writer)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.select_column_names_.count(); ++i) {
+    ObObj name;
+    name.set_varchar(MY_SPEC.select_column_names_.at(i));
+    name.set_collation_type(cs_type_);
+    OZ(print_field(name, data_writer));
+    if (OB_SUCC(ret) && i + 1 < MY_SPEC.select_column_names_.count()) {
+      OZ(write_obj_to_file(field_str_, data_writer));
+    }
+  }
+  OZ(write_obj_to_file(line_str_, data_writer));
+  OZ(data_writer.flush_shared_buf(shared_buf_));
+  if (has_compress_) {
+    OZ(data_writer.flush_buf());
+  }
+  if (OB_SUCC(ret)) {
+    header_written_ = true;
   }
   return ret;
 }
@@ -1201,24 +1268,40 @@ int ObSelectIntoOp::create_shared_buffer_for_data_writer()
 int ObSelectIntoOp::check_secure_file_path(ObString file_name)
 {
   int ret = OB_SUCCESS;
-  ObString file_path = file_name.split_on(file_name.reverse_find('/'));
-  char full_path_buf[PATH_MAX+1];
-  char *actual_path = nullptr;
-  ObSqlString sql_str;
-  ObString secure_file_priv;
-  
-  if (OB_FAIL(sql_str.append(file_path.empty() ? "." : file_path))) {
+  const char *separator_ptr = file_name.reverse_find('/');
 #ifdef _WIN32
-  } else if (OB_ISNULL(actual_path = _fullpath(full_path_buf, sql_str.ptr(), PATH_MAX))) {
-#else
-  } else if (OB_ISNULL(actual_path = realpath(sql_str.ptr(), full_path_buf))) {
+  const char *backslash = file_name.reverse_find('\\');
+  if (nullptr != backslash && (nullptr == separator_ptr || backslash > separator_ptr)) {
+    separator_ptr = backslash;
+  }
 #endif
-    ret = OB_FILE_NOT_EXIST;
+  const int64_t separator = nullptr == separator_ptr ? -1 : separator_ptr - file_name.ptr();
+  int64_t parent_length = separator;
+  if (0 == separator) {
+    parent_length = 1;
+  }
+#ifdef _WIN32
+  if (2 == separator && file_name.length() > 2 && ':' == file_name.ptr()[1]) {
+    parent_length = 3;
+  }
+#endif
+  std::string parent = separator < 0 ? "."
+      : std::string(file_name.ptr(), parent_length);
+#ifdef _WIN32
+  if (separator < 0 && file_name.length() >= 2 && ':' == file_name.ptr()[1]) {
+    parent.assign(file_name.ptr(), 2);
+    parent += ".";
+  }
+#endif
+  std::string canonical_parent;
+  ObString secure_file_priv;
+  if (OB_FAIL(ObFileScanUtils::canonicalize_path(parent, canonical_parent))) {
   } else if (OB_FAIL(ObSchemaUtils::get_runtime_varchar_variable(*GCTX.schema_service_,
-                                                                SYS_VAR_SECURE_FILE_PRIV,
-                                                                ctx_.get_allocator(),
-                                                                secure_file_priv))) {
-  } else if (OB_FAIL(ObResolverUtils::check_secure_path(secure_file_priv, actual_path))) {
+                                                               SYS_VAR_SECURE_FILE_PRIV,
+                                                               ctx_.get_allocator(),
+                                                               secure_file_priv))) {
+  } else if (OB_FAIL(ObResolverUtils::check_secure_path(
+               secure_file_priv, ObString(static_cast<int32_t>(canonical_parent.size()), canonical_parent.data())))) {
     if (OB_ERR_NO_PRIVILEGE == ret) {
       ret = OB_ERR_NO_PRIV_DIRECT_PATH_ACCESS;
       LOG_ERROR("failed to check secure path", K(ret), K(secure_file_priv));

@@ -63,6 +63,44 @@ eval select id, name, score
        from read_csv('$FILE_SQL_DATA_DIR/export.csv')
       order by id;
 
+--echo # forced nested-loop rescans preserve every match
+--echo # inferred timestamp precision preserves whole and fractional seconds
+eval copy (select '2026-08-01 10:11:12' as whole_seconds,
+                  '2026-08-01 10:11:12.123456' as fractional_seconds)
+       to '$FILE_SQL_DATA_DIR/time-precision.csv' (format csv,header);
+eval select whole_seconds,fractional_seconds
+       from read_csv('$FILE_SQL_DATA_DIR/time-precision.csv');
+
+eval select /*+ LEADING(c j) USE_NL(j) NO_USE_NL_MATERIALIZATION(j) */
+             c.id as left_id,j.id as right_id
+        from read_csv('$FILE_SQL_DATA_DIR/basic.csv') c
+        join read_csv('$FILE_SQL_DATA_DIR/basic.csv') j on c.id=j.id
+       order by c.id;
+
+--echo # DESCRIBE keeps a quoted alias as metadata
+eval desc select id as 'quoted''name' from read_csv('$FILE_SQL_DATA_DIR/basic.csv');
+
+--echo # COPY roundtrip preserves quoted fields and newlines
+eval copy (select id,note from read_csv('$FILE_SQL_DATA_DIR/basic.csv') order by id)
+        to '$FILE_SQL_DATA_DIR/quoted-export.csv' (format csv,header,nullstr 'NULL');
+eval select id,replace(note,char(10),'<NL>') as note
+        from read_csv('$FILE_SQL_DATA_DIR/quoted-export.csv') order by id;
+
+--echo # COPY failure removes only its own incomplete file
+--disable_result_log
+--error 3141
+eval copy (select /*+ OPT_PARAM('ROWSETS_MAX_ROWS',1) */ id,
+              json_extract(case when id=1 then '{}' else 'not-json' end,'$.x')
+              from read_csv('$FILE_SQL_DATA_DIR/basic.csv'))
+        to '$FILE_SQL_DATA_DIR/failed-export.csv' (format csv,header,nullstr 'NULL');
+--enable_result_log
+eval select count(*) as incomplete_files from glob('$FILE_SQL_DATA_DIR/failed-export.csv');
+--disable_result_log
+--error 1086
+eval copy (select 123 as id) to '$FILE_SQL_DATA_DIR/export.csv' (format csv,header,nullstr 'NULL');
+--enable_result_log
+eval select id,name,score from read_csv('$FILE_SQL_DATA_DIR/export.csv') order by id;
+
 set session enable_file_sql = OFF;
 --enable_query_log
 

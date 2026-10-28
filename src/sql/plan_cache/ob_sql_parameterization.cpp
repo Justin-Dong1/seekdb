@@ -292,6 +292,11 @@ bool ObSqlParameterization::is_tree_not_param(const ParseNode *tree)
     ret_bool = true;
   } else if (true == tree->is_tree_not_param_) {
     ret_bool = true;
+  } else if (T_FILE_SCAN_TABLE == tree->type_
+             || T_FILE_LIST_TABLE == tree->type_
+             || T_FILE_SCHEMA_TABLE == tree->type_) {
+    // Paths and inference options define the dynamic table schema at resolution.
+    ret_bool = true;
   } else if (T_GROUPBY_CLAUSE == tree->type_) {
     // select a from t group by 1 enables group by parameterization
     ret_bool = true;

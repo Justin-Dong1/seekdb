@@ -271,7 +271,7 @@ END_P SET_VAR DELIMITER
 
         CACHE CALIBRATION CALIBRATION_INFO CALC_PARTITION_ID CANCEL CASCADED CAST CATALOG_NAME CHAIN CHANGED CHARSET CHECKSUM CHECKPOINT CHUNK CIPHER CLIENT
         CLASS_ORIGIN CLEAN CLEAR CLOG CLOSE COALESCE COLUMN_STAT
-        CODE COLLATION COLUMN_FORMAT COLUMN_NAME COLUMNS COMMENT COMMIT COMMITTED COMPACT COMPLETE COPY
+        CODE COLLATION COLUMN_FORMAT COLUMN_NAME COLUMNS COMMENT COMMIT COMMITTED COMPACT COMPLETE COPY CSV
         COMPRESSED COMPRESSION COMPRESSION_CODE COMPUTATION CONCURRENT CONDENSED CONDITIONAL CONNECTION CONSISTENT CONSISTENT_MODE CONSTRAINT_CATALOG
         CONSTRAINT_NAME CONSTRAINT_SCHEMA CONTAINS CONTRIBUTORS COSINE COUNT CPU CREATE_TIMESTAMP
         CTXCAT CTX_ID CUBE CURDATE CURRENT STACKED CURTIME CURSOR_NAME CUME_DIST CYCLE CONNECT
@@ -285,14 +285,14 @@ END_P SET_VAR DELIMITER
         ERROR_CODE ERROR_P ERRORS ESCAPE EXCHANGE EXCLUDING EXECUTE EXPANSION EXPORT OUTLINE
         EXTENDED EXCLUSIVE EXTENDED_NOADDR EXTENT_SIZE EXTRACT EXCEPT EXPIRED ENCODING EMPTY_FIELD_AS_NULL EUCLIDEAN
 
-        FAIL FAILOVER FAST FAULTS FIELDS FILEX FIRST FIRST_VALUE FIXED FLUSH FORMAT
+        FAIL FAILOVER FAST FAULTS FIELDS FILEX FILE_SCAN FILE_LIST FILE_SCHEMA FIRST FIRST_VALUE FIXED FLUSH FORMAT
         FOUND FORK FREEZE FREQUENCY FUNCTION FOLLOWING FLASHBACK FULL FRAGMENTATION FROZEN FILE_ID FILTER
         FIELD_OPTIONALLY_ENCLOSED_BY FIELD_DELIMITER FIELD_ENCLOSED_BY FILE_EXTENSION
 
-        GENERAL GEOMETRY GEOMCOLLECTION GEOMETRYCOLLECTION GET_FORMAT GLOBAL GRANTS GROUP_CONCAT GROUPING
+        GENERAL GEOMETRY GEOMCOLLECTION GEOMETRYCOLLECTION GET_FORMAT GLOBAL GLOB GRANTS GROUP_CONCAT GROUPING
         GLOBAL_ALIAS
 
-        HASH HEAP HELP HISTOGRAM HOUR HIDDEN HYBRID HYBRID_HIST HYBRID_SEARCH
+        HASH HEADER HEAP HELP HISTOGRAM HOUR HIDDEN HYBRID HYBRID_HIST HYBRID_SEARCH
 
         IDENTIFIED IK_MODE ILOG IMMEDIATE IMPORT INCLUDING INCR INDEXES INFO
         INNODB INPLACE INSERT_METHOD INSTANT INSTANCE INVOKER IO IO_THREAD IPC ISOLATE ISOLATION ISSUER
@@ -318,7 +318,7 @@ END_P SET_VAR DELIMITER
 
         NAME NAMES NAMESPACE NATIONAL NCHAR NDB NDBCLUSTER NESTED NEW NEXT NO NOAUDIT NONE NORMAL NOW NOWAIT NEVER NGRAM_TOKEN_SIZE
         NO_WAIT NULLS NUMBER NVARCHAR NTILE NTH_VALUE NETWORK NOPARALLEL
-        NULL_IF_EXETERNAL
+        NULL_IF_EXETERNAL NULLSTR
 
         OBSOLETE OBJECT OCCUR OF OFF OFFSET OLD OLD_PASSWORD ONE ONE_SHOT ONLY OPEN OPTIONS ORDINALITY OURS OLD_KEY OVER
         OJ
@@ -332,7 +332,7 @@ END_P SET_VAR DELIMITER
 
         QUANTIFIER_TABLE QUARTER QUERY QUEUE_TIME QUICK
 
-        RECOVER REDUNDANT REFRESH RELAY RELAYLOG RELAY_LOG_FILE RELAY_LOG_POS RELAY_THREAD RELOAD REMOVE
+        READ_CSV READ_JSON READ_NDJSON READ_PARQUET RECOVER REDUNDANT REFRESH RELAY RELAYLOG RELAY_LOG_FILE RELAY_LOG_POS RELAY_THREAD RELOAD REMOVE
         REPEATABLE RESET RESPECT RESTART RESTORE RESUME RETURNED_SQLSTATE RETURNS RETURNING REVERSE
         REWRITE ROLLBACK ROLLUP ROUTINE ROW ROWID ROW_COUNT ROW_FORMAT ROWS RTREE
         RUN RECYCLEBIN REPLICATION ROTATE ROW_NUMBER RUDUNDANT RECURSIVE RANDOM REDO_TRANSPORT_OPTIONS
@@ -372,7 +372,7 @@ END_P SET_VAR DELIMITER
         ORGANIZATION
 //-----------------------------non_reserved keyword end---------------------------------------------
 %type <node> sql_stmt stmt_list stmt opt_end_p
-%type <node> select_stmt update_stmt delete_stmt
+%type <node> select_stmt copy_stmt update_stmt delete_stmt
 %type <node> insert_stmt single_table_insert values_clause dml_table_name
 %type <node> create_table_stmt create_table_like_stmt fork_table_stmt fork_database_stmt diff_table_stmt merge_table_stmt opt_table_option_list table_option_list table_option table_option_list_space_seperated parallel_option lob_storage_clause lob_storage_parameter lob_storage_parameters lob_chunk_size
 %type <node> index_or_heap
@@ -511,6 +511,8 @@ END_P SET_VAR DELIMITER
 %type <node> column_list_with_boost with_param_column_ref
 %type <node> es_sql_opt
 %type <node> hybrid_search_expr hybrid_search_param
+%type <node> file_scan_expr file_list_expr file_schema_expr read_file_expr read_file_function glob_expr
+%type <node> opt_file_scan_options file_scan_option_list file_scan_option file_scan_option_name
 %type <node> vector_similarity_expr vector_similarity_metric
 %type <node> algorithm_opt lock_opt
 %type <node> flush_privileges_stmt opt_flush_privileges_scope
@@ -556,6 +558,7 @@ opt_end_p:
 /* only preparable statement will set question mark size */
 stmt:
     select_stmt             { $$ = $1; question_mark_issue($$, result); }
+  | copy_stmt               { $$ = $1; question_mark_issue($$, result); }
   | insert_stmt             { $$ = $1; question_mark_issue($$, result); }
   | create_table_stmt       {
     $$ = $1;
@@ -8453,6 +8456,79 @@ select_no_parens opt_when
 }
 ;
 
+// DuckDB-compatible export syntax used by the file SQL competition task.
+// Reuse the mature SELECT INTO OUTFILE resolver and execution path.
+copy_stmt:
+COPY '(' select_no_parens ')' TO STRING_VALUE
+  '(' FORMAT CSV ',' HEADER ',' NULLSTR STRING_VALUE ')'
+{
+  ParseNode *format_value = NULL;
+  ParseNode *format_option = NULL;
+  ParseNode *header_value = NULL;
+  ParseNode *header_option = NULL;
+  ParseNode *null_list = NULL;
+  ParseNode *null_option = NULL;
+  ParseNode *options = NULL;
+  ParseNode *format_list = NULL;
+  ParseNode *into_node = NULL;
+
+  malloc_terminal_node(format_value, result->malloc_pool_, T_VARCHAR);
+  format_value->str_value_ = "csv";
+  format_value->str_len_ = 3;
+  malloc_non_terminal_node(format_option, result->malloc_pool_,
+                           T_EXTERNAL_FILE_FORMAT_TYPE, 1, format_value);
+
+  malloc_terminal_node(header_value, result->malloc_pool_, T_BOOL);
+  header_value->value_ = 1;
+  malloc_non_terminal_node(header_option, result->malloc_pool_,
+                           T_PARSE_HEADER, 1, header_value);
+
+  malloc_non_terminal_node(null_list, result->malloc_pool_, T_EXPR_LIST, 1, $14);
+  malloc_non_terminal_node(null_option, result->malloc_pool_,
+                           T_NULL_IF_EXETERNAL, 1, null_list);
+  malloc_non_terminal_node(options, result->malloc_pool_, T_LINK_NODE, 2,
+                           format_option, header_option);
+  malloc_non_terminal_node(options, result->malloc_pool_, T_LINK_NODE, 2,
+                           options, null_option);
+  /* COPY CSV defaults differ from SELECT INTO OUTFILE's tab-separated format. */
+  ParseNode *delimiter_value = NULL;
+  ParseNode *delimiter_option = NULL;
+  ParseNode *quote_value = NULL;
+  ParseNode *quote_option = NULL;
+  ParseNode *escape_option = NULL;
+  malloc_terminal_node(delimiter_value, result->malloc_pool_, T_VARCHAR);
+  delimiter_value->str_value_ = ",";
+  delimiter_value->str_len_ = 1;
+  malloc_non_terminal_node(delimiter_option, result->malloc_pool_, T_FIELD_TERMINATED_STR, 1, delimiter_value);
+  delimiter_option->str_value_ = "','";
+  delimiter_option->str_len_ = 3;
+  malloc_terminal_node(quote_value, result->malloc_pool_, T_VARCHAR);
+  quote_value->str_value_ = "\"";
+  quote_value->str_len_ = 1;
+  malloc_non_terminal_node(quote_option, result->malloc_pool_, T_OPTIONALLY_CLOSED_STR, 1, quote_value);
+  quote_option->str_value_ = "'\"'";
+  quote_option->str_len_ = 3;
+  malloc_non_terminal_node(escape_option, result->malloc_pool_, T_ESCAPED_STR, 1, quote_value);
+  escape_option->str_value_ = "'\"'";
+  escape_option->str_len_ = 3;
+  malloc_non_terminal_node(options, result->malloc_pool_, T_LINK_NODE, 2, options, delimiter_option);
+  malloc_non_terminal_node(options, result->malloc_pool_, T_LINK_NODE, 2, options, quote_option);
+  malloc_non_terminal_node(options, result->malloc_pool_, T_LINK_NODE, 2, options, escape_option);
+  merge_nodes(format_list, result, T_EXTERNAL_FILE_FORMAT, options);
+  malloc_non_terminal_node(into_node, result->malloc_pool_, T_INTO_OUTFILE, 3,
+                           $6, format_list, NULL);
+
+  $$ = $3;
+  if ($$->children_[PARSE_SELECT_INTO] != NULL
+      || $$->children_[PARSE_SELECT_INTO_EXTRA] != NULL) {
+    yyerror(&@1, result, "COPY query must not contain INTO\n");
+    YYERROR;
+  } else {
+    $$->children_[PARSE_SELECT_INTO_EXTRA] = into_node;
+  }
+}
+;
+
 // for select_into
 //select ..from/.. into ..
 select_into:
@@ -10848,6 +10924,26 @@ tbl_name
 {
   $$ = $1;
 }
+| file_scan_expr
+{
+  $$ = $1;
+}
+| file_list_expr
+{
+  $$ = $1;
+}
+| file_schema_expr
+{
+  $$ = $1;
+}
+| read_file_expr
+{
+  $$ = $1;
+}
+| glob_expr
+{
+  $$ = $1;
+}
 ;
 
 tbl_name:
@@ -12265,7 +12361,16 @@ explain_or_desc relation_factor opt_desc_column_option
   malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_COLUMNS, 4, $$, $2, NULL, $3);
 }
 
-| explain_or_desc explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL);}
+| explain_or_desc explainable_stmt
+{
+  GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL);
+  /* Preserve DESCRIBE's schema intent; EXPLAIN continues to produce a plan. */
+  /* value_ is reserved for the statement parameter count. */
+  if (NULL != $1) {
+    $$->str_value_ = $1->str_value_;
+    $$->str_len_ = $1->str_len_;
+  }
+}
 | explain_or_desc PRETTY explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, T_PRETTY, $3, NULL, NULL);}
 | explain_or_desc PRETTY_COLOR explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, T_PRETTY_COLOR, $3, NULL, NULL);}
 
@@ -12306,8 +12411,14 @@ explain_or_desc relation_factor opt_desc_column_option
 
 explain_or_desc:
 EXPLAIN {$$ = NULL;}
-| DESCRIBE {$$ = NULL;}
-| DESC  {$$ = NULL;}
+| DESCRIBE
+{
+  get_non_reserved_node($$, result->malloc_pool_, @1.first_column, @1.last_column);
+}
+| DESC
+{
+  get_non_reserved_node($$, result->malloc_pool_, @1.first_column, @1.last_column);
+}
 ;
 
 explainable_stmt:
@@ -17479,6 +17590,160 @@ literal
 }
 ;
 
+file_scan_expr:
+FILE_SCAN '(' literal ')' %prec LOWER_PARENS
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SCAN_TABLE, 3, $3, NULL, NULL);
+}
+| FILE_SCAN '(' literal ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SCAN_TABLE, 3, $3, NULL, $5);
+}
+| FILE_SCAN '(' literal ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SCAN_TABLE, 3, $3, NULL, $6);
+}
+| FILE_SCAN '(' literal ',' literal ')' %prec LOWER_PARENS
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SCAN_TABLE, 3, $3, $5, NULL);
+}
+| FILE_SCAN '(' literal ',' literal ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SCAN_TABLE, 3, $3, $5, $7);
+}
+| FILE_SCAN '(' literal ',' literal ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SCAN_TABLE, 3, $3, $5, $8);
+}
+;
+
+file_list_expr:
+FILE_LIST '(' literal ')' %prec LOWER_PARENS
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_LIST_TABLE, 2, $3, NULL);
+}
+| FILE_LIST '(' literal ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_LIST_TABLE, 2, $3, $5);
+}
+| FILE_LIST '(' literal ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_LIST_TABLE, 2, $3, $6);
+}
+;
+
+file_schema_expr:
+FILE_SCHEMA '(' literal ')' %prec LOWER_PARENS
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SCHEMA_TABLE, 2, $3, NULL);
+}
+| FILE_SCHEMA '(' literal ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SCHEMA_TABLE, 2, $3, $5);
+}
+| FILE_SCHEMA '(' literal ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SCHEMA_TABLE, 2, $3, $6);
+}
+;
+
+read_file_expr:
+read_file_function '(' literal opt_file_scan_options ')' %prec LOWER_PARENS
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SCAN_TABLE, 4, $3, $1, NULL, $4);
+}
+| read_file_function '(' literal opt_file_scan_options ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SCAN_TABLE, 4, $3, $1, $6, $4);
+}
+| read_file_function '(' literal opt_file_scan_options ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SCAN_TABLE, 4, $3, $1, $7, $4);
+}
+;
+
+read_file_function:
+READ_CSV
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_VARCHAR);
+  $$->str_value_ = "csv";
+  $$->str_len_ = strlen("csv");
+}
+| READ_JSON
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_VARCHAR);
+  $$->str_value_ = "jsonl";
+  $$->str_len_ = strlen("jsonl");
+}
+| READ_NDJSON
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_VARCHAR);
+  $$->str_value_ = "jsonl";
+  $$->str_len_ = strlen("jsonl");
+}
+| READ_PARQUET
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_VARCHAR);
+  $$->str_value_ = "parquet";
+  $$->str_len_ = strlen("parquet");
+}
+;
+
+opt_file_scan_options:
+/* empty */
+{
+  $$ = NULL;
+}
+| ',' file_scan_option_list
+{
+  $$ = $2;
+}
+;
+
+file_scan_option_list:
+file_scan_option
+{
+  malloc_list_node($$, result->malloc_pool_, T_EXPR_LIST, 2, 1, $1);
+}
+| file_scan_option_list ',' file_scan_option
+{
+  push_back_list(result->malloc_pool_, result, $$, $1, $3);
+}
+;
+
+file_scan_option:
+file_scan_option_name COMP_EQ signed_literal
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_OP_EQ, 2, $1, $3);
+}
+;
+
+file_scan_option_name:
+relation_name
+{
+  $$ = $1;
+}
+| HEADER
+{
+  get_non_reserved_node($$, result->malloc_pool_, @1.first_column, @1.last_column);
+}
+;
+
+glob_expr:
+GLOB '(' literal ')' %prec LOWER_PARENS
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_LIST_TABLE, 3, $3, NULL, NULL);
+}
+| GLOB '(' literal ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_LIST_TABLE, 3, $3, $5, NULL);
+}
+| GLOB '(' literal ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_LIST_TABLE, 3, $3, $6, NULL);
+}
+;
+
 unreserved_keyword:
 unreserved_keyword_for_role_name { $$=$1;}
 | unreserved_keyword_ambiguous_roles { $$=$1;}
@@ -18181,6 +18446,14 @@ ACCOUNT
 |       INCONSISTENT 
 |       INDIVIDUAL
 |       HYBRID_SEARCH
+|       FILE_SCAN
+|       FILE_LIST
+|       FILE_SCHEMA
+|       READ_CSV
+|       READ_JSON
+|       READ_NDJSON
+|       READ_PARQUET
+|       GLOB
 ;
 
 unreserved_keyword_special:

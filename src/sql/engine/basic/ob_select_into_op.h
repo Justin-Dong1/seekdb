@@ -64,6 +64,7 @@ public:
       closed_cht_(),
       is_optional_(false),
       select_exprs_(alloc),
+      select_column_names_(alloc),
       is_single_(true),
       max_file_size_(DEFAULT_MAX_FILE_SIZE),
       escaped_cht_(),
@@ -83,6 +84,7 @@ public:
   common::ObObj closed_cht_;
   bool is_optional_;
   common::ObFixedArray<ObExpr*, common::ObIAllocator> select_exprs_;
+  common::ObFixedArray<common::ObString, common::ObIAllocator> select_column_names_;
   bool is_single_;
   int64_t max_file_size_;
   common::ObObj escaped_cht_;
@@ -102,6 +104,7 @@ public:
     : ObOperator(exec_ctx, spec, input),
       top_limit_cnt_(INT64_MAX),
       is_first_(true),
+      header_written_(false),
       field_str_(),
       line_str_(),
       cs_type_(CS_TYPE_INVALID),
@@ -203,6 +206,7 @@ private:
   int into_dumpfile(ObExternalFileWriter *data_writer);
   int into_outfile(ObExternalFileWriter *data_writer);
   int into_outfile_batch_csv(const ObBatchRows &brs, ObExternalFileWriter *data_writer);
+  int write_csv_header(ObCsvFileWriter &data_writer);
   int extract_fisrt_wchar_from_varhcar(const ObObj &obj, int32_t &wchar);
   int print_wchar_to_buf(char *buf,
                          const int64_t buf_len,
@@ -266,6 +270,7 @@ private:
 private:
   int64_t top_limit_cnt_;
   bool is_first_;
+  bool header_written_;
   ObObj field_str_;
   ObObj line_str_;
   ObObj file_name_;
