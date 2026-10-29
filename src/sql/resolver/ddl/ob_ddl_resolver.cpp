@@ -1782,7 +1782,6 @@ int collect_ai_column_dependencies(const ParseNode *node, const ObTableSchema &t
         ret = OB_ERR_BAD_FIELD_ERROR;
       } else if (dependency->is_ai_column()) {
         ret = OB_NOT_SUPPORTED;
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI column depending on another AI column");
       } else {
         ObJsonInt *id = OB_NEWx(ObJsonInt, &allocator, dependency->get_column_id());
         if (id == nullptr) {

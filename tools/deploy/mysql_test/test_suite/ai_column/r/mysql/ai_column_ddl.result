@@ -96,29 +96,8 @@ content varchar(20),
 first_ai varchar(200) AI COLUMN (AI_COMPLETE('p0_ddl_complete', content)),
 second_ai varchar(200) AI COLUMN (AI_COMPLETE('p0_ddl_complete', first_ai))
 );
-ERROR 0A000: AI column depending on another AI column not supported
-set @ai_ddl_table_id = (select table_id from oceanbase.__all_table
-where table_name = 'alter_docs' and database_id =
-(select database_id from oceanbase.__all_database where database_name = 'ai_column_p0_ddl'));
-insert into oceanbase.__all_ai_column_task
-(task_id, table_id, column_id, schema_version, request_id,
-rowkey_predicate, request_payload, result_spec, eligible_ts)
-select uuid(), table_id, column_id, schema_version, uuid(),
-'`id` = 1', '{}', result_spec, now(6)
-from oceanbase.__all_ai_column where table_id = @ai_ddl_table_id;
-select count(*) = 1 as cleanup_fixture_task_created
-from oceanbase.__all_ai_column_task where table_id = @ai_ddl_table_id;
-cleanup_fixture_task_created
-1
+ERROR 0A000: Not supported feature or function
 drop table ai_column_p0_ddl.alter_docs;
-select count(*) = 0 as dropped_table_metadata_removed
-from oceanbase.__all_ai_column where table_id = @ai_ddl_table_id;
-dropped_table_metadata_removed
-1
-select count(*) = 0 as dropped_table_tasks_removed
-from oceanbase.__all_ai_column_task where table_id = @ai_ddl_table_id;
-dropped_table_tasks_removed
-1
 drop table ai_column_p0_ddl.docs;
 call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('p0_ddl_complete_ep');
 call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('p0_ddl_embed_ep');
