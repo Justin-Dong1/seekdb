@@ -207,6 +207,11 @@ int ObFileScanOp::get_next_list_row()
     const ObFileTableKind kind = static_cast<ObFileTableKind>(file_spec().kind_);
     if (ObFileTableKind::GLOB == kind) {
       const std::string pattern(file_spec().glob_pattern_.ptr(), file_spec().glob_pattern_.length());
+      // Wildcards do not implicitly include hidden directory entries. An
+      // explicit leading dot still permits queries such as glob('/data/.*').
+      if (entry->d_name[0] == '.' && (pattern.empty() || pattern[0] != '.')) {
+        continue;
+      }
       if (!match_glob_pattern(pattern.c_str(), entry->d_name)) {
         continue;
       }

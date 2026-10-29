@@ -158,7 +158,7 @@ int execute_ai_column_retry(ObExecContext &ctx, ObAlterTableStmt &stmt, const Ob
   ObSchemaGetterGuard *guard = ctx.get_sql_ctx() == NULL ? NULL : ctx.get_sql_ctx()->schema_guard_;
   if (OB_ISNULL(guard) || OB_ISNULL(ctx.get_sql_proxy())) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (OB_FAIL(guard->get_table_schema(stmt.get_alter_table_arg().table_id_, table))) {
+  } else if (OB_FAIL(guard->get_table_schema(stmt.get_alter_table_schema().get_table_id(), table))) {
   } else if (OB_ISNULL(table)
              || OB_ISNULL(ai_column = table->get_column_schema(stmt.get_ai_column_retry_name()))
              || !ai_column->is_ai_column()) {
