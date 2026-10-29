@@ -401,6 +401,27 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
       } else if (FALSE_IT(alter_table_stmt->inc_alter_table_action_count())) {
       } else {
         switch (action_node->type_) {
+        case T_ALTER_AI_COLUMN_RETRY: {
+          const ObColumnSchemaV2 *column_schema = NULL;
+          ObString column_name;
+          if (node.num_child_ != 1) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "RETRY AI COLUMN mixed with another ALTER action");
+          } else if (action_node->num_child_ != 2 || OB_ISNULL(action_node->children_)
+                     || OB_ISNULL(action_node->children_[0])
+                     || OB_ISNULL(action_node->children_[0]->str_value_)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (FALSE_IT(column_name.assign_ptr(
+                         action_node->children_[0]->str_value_,
+                         static_cast<int32_t>(action_node->children_[0]->str_len_)))) {
+          } else if (OB_ISNULL(column_schema = table_schema_->get_column_schema(column_name))
+                     || !column_schema->is_ai_column()) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "RETRY target must be exactly one AI COLUMN");
+          } else if (OB_FAIL(alter_table_stmt->set_ai_column_retry(column_name))) {
+          }
+          break;
+        }
         //deal with alter table option
         case T_ALTER_TABLE_OPTION: {
             alter_table_stmt->set_alter_table_option();

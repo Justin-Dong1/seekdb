@@ -508,6 +508,29 @@ int ai_assignment_invalidated(const ObColumnSchemaV2 &column, const ObTableSchem
   return ret;
 }
 
+int ai_state_assignment_invalidated(const ObColumnSchemaV2 &state_column,
+                                    const ObTableSchema &table,
+                                    const ObIArray<ObAssignment> &assignments,
+                                    bool &invalidated)
+{
+  int ret = OB_SUCCESS;
+  invalidated = false;
+  for (ObTableSchema::const_column_iterator iter = table.column_begin();
+       OB_SUCC(ret) && !invalidated && iter != table.column_end(); ++iter) {
+    const ObColumnSchemaV2 *ai_column = *iter;
+    if (OB_ISNULL(ai_column)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (ai_column->is_ai_column()) {
+      ObSqlString state_name;
+      OZ(state_name.append_fmt("__ai_%lu_state", ai_column->get_column_id()));
+      if (OB_SUCC(ret) && 0 == state_column.get_column_name_str().compare(state_name.string())) {
+        OZ(ai_assignment_invalidated(*ai_column, table, assignments, invalidated));
+      }
+    }
+  }
+  return ret;
+}
+
 int mark_ai_vector_index_update(const ObColumnSchemaV2 &column,
                                 const ObTableSchema &table,
                                 ObSchemaGetterGuard &schema_guard,
@@ -570,6 +593,7 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
         ObColumnSchemaV2 *column_schema = *iter;
         bool need_assigned = false;
         bool ai_invalidated = false;
+        bool ai_state_invalidated = false;
         uint64_t column_id = OB_INVALID_ID;
         if (NULL == column_schema) {
           ret = OB_ERR_UNEXPECTED;
@@ -578,6 +602,9 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
           //do nothing
         } else if (OB_FAIL(ai_assignment_invalidated(*column_schema, *table_schema,
                                                     assigns.at(i).assignments_, ai_invalidated))) {
+        } else if (OB_FAIL(ai_state_assignment_invalidated(*column_schema, *table_schema,
+                                                           assigns.at(i).assignments_,
+                                                           ai_state_invalidated))) {
         } else if (OB_FAIL(mark_ai_vector_index_update(*column_schema, *table_schema,
                                                       *schema_guard, ai_invalidated,
                                                       update_with_vector_index))) {
@@ -586,7 +613,7 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
                                                  trigger_exist,
                                                  *column_schema,
                                                  need_assigned))) {
-        } else if (FALSE_IT(need_assigned = need_assigned || ai_invalidated ||
+        } else if (FALSE_IT(need_assigned = need_assigned || ai_invalidated || ai_state_invalidated ||
                                             ((column_schema->is_vec_hnsw_vid_column() ||
                                               column_schema->is_vec_ivf_center_id_column()) && 
                                              (update_with_vector_index || T_INSERT_SCOPE == scope)))) {
@@ -607,6 +634,13 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
             assignment.is_implicit_ = true;
             if (ai_invalidated) {
               ret = ObRawExprUtils::build_null_expr(*params_.expr_factory_, assignment.expr_);
+            } else if (ai_state_invalidated) {
+              ObConstRawExpr *state_expr = NULL;
+              if (OB_FAIL(ObRawExprUtils::build_const_int_expr(
+                  *params_.expr_factory_, ObIntType, 0, state_expr))) {
+              } else {
+                assignment.expr_ = state_expr;
+              }
             } else if (column_schema->is_on_update_current_timestamp()) {
               assignment.column_expr_->set_result_flag(ON_UPDATE_NOW_FLAG);
               ObDefaultValueUtils utils(stmt, &params_, this);

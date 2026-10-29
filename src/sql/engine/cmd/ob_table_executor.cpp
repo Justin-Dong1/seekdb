@@ -39,6 +39,8 @@
 #include "sql/resolver/ddl/ob_optimize_stmt.h"
 #include "sql/resolver/dml/ob_delete_resolver.h"
 #include "sql/engine/cmd/ob_partition_executor_utils.h"
+#include <cctype>
+#include <cstring>
 
 #include "sql/printer/ob_select_stmt_printer.h"
 #include "share/ob_structured_event_logger.h"
@@ -50,6 +52,194 @@ using namespace share::schema;
 using namespace observer;
 namespace sql
 {
+
+namespace
+{
+bool ai_retry_word_at(const ObString &text, const int64_t pos, const char *word)
+{
+  const int64_t len = static_cast<int64_t>(strlen(word));
+  bool match = pos >= 0 && pos + len <= text.length();
+  for (int64_t i = 0; match && i < len; ++i) {
+    match = std::tolower(static_cast<unsigned char>(text.ptr()[pos + i])) == word[i];
+  }
+  const bool left_word = pos > 0
+      && (std::isalnum(static_cast<unsigned char>(text.ptr()[pos - 1])) || text.ptr()[pos - 1] == '_');
+  const bool right_word = pos + len < text.length()
+      && (std::isalnum(static_cast<unsigned char>(text.ptr()[pos + len])) || text.ptr()[pos + len] == '_');
+  return match && !left_word && !right_word;
+}
+
+int append_ai_retry_identifier(ObSqlString &sql, const ObString &name)
+{
+  int ret = sql.append("`");
+  for (int64_t i = 0; OB_SUCC(ret) && i < name.length(); ++i) {
+    if (name.ptr()[i] == '`') { OZ(sql.append("`")); }
+    OZ(sql.append(name.ptr() + i, 1));
+  }
+  OZ(sql.append("`"));
+  return ret;
+}
+
+int append_ai_retry_literal(ObSqlString &sql, const ObString &value)
+{
+  int ret = sql.append("'");
+  for (int64_t i = 0; OB_SUCC(ret) && i < value.length(); ++i) {
+    if (value.ptr()[i] == '\\' || value.ptr()[i] == '\'') {
+      OZ(sql.append(value.ptr() + i, 1));
+    }
+    OZ(sql.append(value.ptr() + i, 1));
+  }
+  OZ(sql.append("'"));
+  return ret;
+}
+
+int build_ai_retry_predicate(const ObString &statement,
+                             const ObString &state_name,
+                             ObSqlString &predicate)
+{
+  int ret = OB_SUCCESS;
+  int64_t where_pos = -1;
+  char quote = 0;
+  for (int64_t i = 0; i < statement.length() && where_pos < 0; ++i) {
+    const char c = statement.ptr()[i];
+    if (quote != 0) {
+      if (c == '\\') { ++i; }
+      else if (c == quote) {
+        if (i + 1 < statement.length() && statement.ptr()[i + 1] == quote) { ++i; }
+        else { quote = 0; }
+      }
+    } else if (c == '\'' || c == '"' || c == '`') {
+      quote = c;
+    } else if (ai_retry_word_at(statement, i, "where")) {
+      where_pos = i + 5;
+    }
+  }
+  if (where_pos < 0) {
+    OZ(predicate.append("1=1"));
+  } else {
+    quote = 0;
+    int64_t end = statement.length();
+    while (end > where_pos && std::isspace(static_cast<unsigned char>(statement.ptr()[end - 1]))) { --end; }
+    if (end > where_pos && statement.ptr()[end - 1] == ';') { --end; }
+    for (int64_t i = where_pos; OB_SUCC(ret) && i < end; ++i) {
+      const char c = statement.ptr()[i];
+      if (quote != 0) {
+        OZ(predicate.append(statement.ptr() + i, 1));
+        if (c == '\\' && i + 1 < end) {
+          OZ(predicate.append(statement.ptr() + ++i, 1));
+        } else if (c == quote) {
+          if (i + 1 < end && statement.ptr()[i + 1] == quote) {
+            OZ(predicate.append(statement.ptr() + ++i, 1));
+          } else {
+            quote = 0;
+          }
+        }
+      } else if (c == '\'' || c == '"' || c == '`') {
+        quote = c;
+        OZ(predicate.append(statement.ptr() + i, 1));
+      } else if (ai_retry_word_at(statement, i, "status")) {
+        OZ(predicate.append("(CASE "));
+        OZ(append_ai_retry_identifier(predicate, state_name));
+        OZ(predicate.append(" WHEN 0 THEN 'PENDING' WHEN 1 THEN 'READY' WHEN 2 THEN 'FAILED' END)"));
+        i += 5;
+      } else {
+        OZ(predicate.append(statement.ptr() + i, 1));
+      }
+    }
+  }
+  return ret;
+}
+
+int execute_ai_column_retry(ObExecContext &ctx, ObAlterTableStmt &stmt, const ObString &first_stmt)
+{
+  int ret = OB_SUCCESS;
+  const ObTableSchema *table = NULL;
+  const ObColumnSchemaV2 *ai_column = NULL;
+  ObSchemaGetterGuard *guard = ctx.get_sql_ctx() == NULL ? NULL : ctx.get_sql_ctx()->schema_guard_;
+  if (OB_ISNULL(guard) || OB_ISNULL(ctx.get_sql_proxy())) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(guard->get_table_schema(stmt.get_alter_table_arg().table_id_, table))) {
+  } else if (OB_ISNULL(table)
+             || OB_ISNULL(ai_column = table->get_column_schema(stmt.get_ai_column_retry_name()))
+             || !ai_column->is_ai_column()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "RETRY target must be exactly one AI COLUMN");
+  }
+
+  ObSqlString qualified_table, state_name, predicate, rowkey_expr, snapshot_prefix;
+  int64_t rowkey_count = 0;
+  if (OB_SUCC(ret)) {
+    OZ(append_ai_retry_identifier(qualified_table, stmt.get_database_name()));
+    OZ(qualified_table.append("."));
+    OZ(append_ai_retry_identifier(qualified_table, table->get_table_name_str()));
+    OZ(state_name.append_fmt("__ai_%lu_state", ai_column->get_column_id()));
+    OZ(build_ai_retry_predicate(first_stmt, state_name.string(), predicate));
+    OZ(rowkey_expr.append("CONCAT("));
+    for (ObTableSchema::const_column_iterator iter = table->column_begin();
+         OB_SUCC(ret) && iter != table->column_end(); ++iter) {
+      const ObColumnSchemaV2 *column = *iter;
+      if (OB_ISNULL(column)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (column->is_rowkey_column()) {
+        ObSqlString quoted_column, key_prefix;
+        OZ(append_ai_retry_identifier(quoted_column, column->get_column_name_str()));
+        if (rowkey_count++ > 0) { OZ(rowkey_expr.append(",' AND ',")); }
+        OZ(key_prefix.append(quoted_column.string()));
+        OZ(key_prefix.append(" = "));
+        OZ(append_ai_retry_literal(rowkey_expr, key_prefix.string()));
+        OZ(rowkey_expr.append(",IFNULL(QUOTE(t."));
+        OZ(rowkey_expr.append(quoted_column.string()));
+        OZ(rowkey_expr.append("),'NULL')"));
+      }
+    }
+    OZ(rowkey_expr.append(")"));
+    if (OB_SUCC(ret) && rowkey_count == 0) { ret = OB_NOT_SUPPORTED; }
+    OZ(snapshot_prefix.append("SELECT * FROM "));
+    OZ(snapshot_prefix.append(qualified_table.string()));
+    OZ(snapshot_prefix.append(" WHERE "));
+  }
+
+  ObMySQLTransaction transaction;
+  int64_t affected_rows = 0;
+  if (OB_SUCC(ret)) {
+    OZ(transaction.start(ctx.get_sql_proxy()));
+  }
+  if (OB_SUCC(ret)) {
+    ObSqlString insert_sql;
+    OZ(insert_sql.append("INSERT INTO oceanbase.__all_ai_column_task "
+        "(task_id,table_id,column_id,schema_version,request_id,rowkey_predicate,"
+        "request_payload,result_spec,max_retries,eligible_ts) SELECT uuid(),a.table_id,"
+        "a.column_id,a.schema_version,uuid(),"));
+    OZ(insert_sql.append(rowkey_expr.string()));
+    OZ(insert_sql.append(",CONCAT("));
+    OZ(append_ai_retry_literal(insert_sql, snapshot_prefix.string()));
+    OZ(insert_sql.append(","));
+    OZ(insert_sql.append(rowkey_expr.string()));
+    OZ(insert_sql.append("),a.result_spec,a.max_retries,now(6) FROM "));
+    OZ(insert_sql.append(qualified_table.string()));
+    OZ(insert_sql.append(" t JOIN oceanbase.__all_ai_column a ON a.table_id="));
+    OZ(insert_sql.append_fmt("%lu AND a.column_id=%lu WHERE (%s)",
+                             table->get_table_id(), ai_column->get_column_id(), predicate.ptr()));
+    OZ(transaction.write(insert_sql.ptr(), affected_rows));
+  }
+  if (OB_SUCC(ret)) {
+    ObSqlString update_sql;
+    OZ(update_sql.append("UPDATE "));
+    OZ(update_sql.append(qualified_table.string()));
+    OZ(update_sql.append(" SET "));
+    OZ(append_ai_retry_identifier(update_sql, ai_column->get_column_name_str()));
+    OZ(update_sql.append("=NULL,"));
+    OZ(append_ai_retry_identifier(update_sql, state_name.string()));
+    OZ(update_sql.append_fmt("=0 WHERE (%s)", predicate.ptr()));
+    OZ(transaction.write(update_sql.ptr(), affected_rows));
+  }
+  if (transaction.is_started()) {
+    const int end_ret = transaction.end(OB_SUCC(ret));
+    if (OB_SUCC(ret)) { ret = end_ret; }
+  }
+  return ret;
+}
+}
 
 ObCreateTableExecutor::ObCreateTableExecutor()
 {
@@ -762,6 +952,8 @@ int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
   OV (OB_NOT_NULL(task_exec_ctx = GET_SQL_EXECUTOR_CTX(ctx)), OB_NOT_INIT);
   if (OB_FAIL(ret)) {
     // do nothing
+  } else if (stmt.is_ai_column_retry()) {
+    ret = execute_ai_column_retry(ctx, stmt, first_stmt);
   } else if (stmt.is_alter_triggers()) {
     if (stmt.get_tg_arg().trigger_infos_.count() > 0) {
       stmt.get_tg_arg().ddl_stmt_str_ = first_stmt;

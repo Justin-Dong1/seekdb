@@ -44,6 +44,10 @@ public:
   bool is_comment_table() const { return is_comment_table_; }
   void set_is_comment_table(const bool flag) { is_comment_table_ = flag; }
 
+  int set_ai_column_retry(const common::ObString &column_name);
+  bool is_ai_column_retry() const { return is_ai_column_retry_; }
+  const common::ObString &get_ai_column_retry_name() const { return ai_column_retry_name_; }
+
   uint64_t get_alter_table_action_count() { return alter_table_action_count_; }
   void inc_alter_table_action_count() { ++alter_table_action_count_; }
 
@@ -107,6 +111,8 @@ public:
 private:
   obcall::ObAlterTableArg alter_table_arg_;
   bool is_comment_table_;
+  bool is_ai_column_retry_;
+  common::ObString ai_column_retry_name_;
   bool is_alter_system_;
   common::ObSArray<obcall::ObCreateIndexArg*> index_arg_list_;
   common::ObIAllocator *fts_arg_allocator_;
