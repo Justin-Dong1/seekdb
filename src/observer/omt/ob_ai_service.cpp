@@ -20,6 +20,7 @@
 #include "sql/privilege_check/ob_ai_model_priv_util.h"
 #include "sql/session/ob_sql_session_info.h"
 #include "sql/engine/ob_exec_context.h"
+#include "observer/omt/ai_column_worker.ipp"
 
 using namespace oceanbase::share;
 using namespace oceanbase::common;
@@ -53,6 +54,7 @@ int ObAiService::init()
   int ret = OB_SUCCESS;
   if (IS_INIT) {
     ret = OB_INIT_TWICE;
+  } else if (OB_FAIL(ObServerThreadHelper::create("AiColumnWorker", 1))) {
   } else {
     is_inited_ = true;
   }
@@ -61,7 +63,25 @@ int ObAiService::init()
 
 void ObAiService::destroy()
 {
+  stop();
+  wait();
+  ObServerThreadHelper::destroy();
   is_inited_ = false;
+}
+
+void ObAiService::do_work()
+{
+  while (!has_set_stop()) {
+    SERVER_MODULE_SCOPE {
+      if (!GCTX.in_bootstrap_ && GCTX.start_service_time_ > 0) {
+        const int ret = process_ai_column_group();
+        if (ret != OB_SUCCESS && ret != OB_ITER_END && REACH_TIME_INTERVAL(10_s)) {
+          LOG_WARN("AI column worker iteration failed", K(ret));
+        }
+      }
+    }
+    idle(100000);
+  }
 }
 
 int ObAiService::get_ai_service_guard(ObAiServiceGuard &ai_service_guard)

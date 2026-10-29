@@ -623,8 +623,13 @@ int maintain_ai_tasks(const ObDMLBaseCtDef &ctdef, ObTableModifyOp &op, bool del
     ret = OB_SCHEMA_ERROR;
   }
   bool has_ai = false;
+  ObSEArray<uint64_t, 4> target_ai_ids;
   for (int64_t i = 0; OB_SUCC(ret) && i < table->get_column_count(); ++i) {
-    has_ai |= table->get_column_schema_by_idx(i)->is_ai_column();
+    const auto *column = table->get_column_schema_by_idx(i);
+    has_ai |= column->is_ai_column();
+    if (update == nullptr && column->is_ai_column()) {
+      OZ(target_ai_ids.push_back(column->get_column_id()));
+    }
   }
   if (OB_FAIL(ret) || !has_ai) { return ret; }
   ObSqlString column_filter;
@@ -634,6 +639,7 @@ int maintain_ai_tasks(const ObDMLBaseCtDef &ctdef, ObTableModifyOp &op, bool del
       const auto &assignment = update->assign_columns_.at(i);
       const auto *column = table->get_column_schema(assignment.column_name_);
       if (column != nullptr && column->is_ai_column() && assignment.is_implicit_) {
+        OZ(target_ai_ids.push_back(column->get_column_id()));
         OZ(column_filter.append_fmt("%s%lu", affected++ == 0 ? " AND column_id IN (" : ",",
                                     column->get_column_id()));
       }
@@ -662,6 +668,19 @@ int maintain_ai_tasks(const ObDMLBaseCtDef &ctdef, ObTableModifyOp &op, bool del
       if (!deleting && update == nullptr) {
         row.at(i)->locate_datum_for_write(op.get_eval_ctx()).set_null();
         row.at(i)->get_eval_info(op.get_eval_ctx()).evaluated_ = true;
+      }
+    } else if (column->is_hidden() && !deleting) {
+      // Hidden state is durable row-local truth after the task row is removed.
+      // 0=PENDING, 1=READY, 2=FAILED.
+      for (int64_t a = 0; a < target_ai_ids.count(); ++a) {
+        ObSqlString state_name;
+        OZ(state_name.append_fmt("__ai_%lu_state", target_ai_ids.at(a)));
+        if (OB_SUCC(ret) && column->get_column_name_str() == state_name.string()) {
+          ObDatum &state = row.at(i)->locate_datum_for_write(op.get_eval_ctx());
+          state.set_int(0);
+          row.at(i)->get_eval_info(op.get_eval_ctx()).evaluated_ = true;
+          break;
+        }
       }
     } else if (!column->is_hidden() && (!deleting || column->is_rowkey_column())) {
       ObDatum *datum = nullptr;

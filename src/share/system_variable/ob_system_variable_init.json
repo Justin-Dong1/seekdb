@@ -10988,5 +10988,18 @@
     "info_cn": "控制是否允许使用 FILE_SCAN、FILE_LIST 和 FILE_SCHEMA 访问本地文件",
     "background_cn": "本地文件访问能力默认关闭，启用后仍受 secure_file_priv 限制",
     "ref_url": ""
+  },
+  "ai_column_strict_read": {
+    "id": 10755,
+    "name": "ai_column_strict_read",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "Reject statements that reference an AI column while any row for that column is pending or failed.",
+    "flags": "SESSION | INFLUENCE_PLAN",
+    "publish_version": "1.0.0.0",
+    "info_cn": "AI 列存在处理中或失败行时，拒绝读取该 AI 列",
+    "background_cn": "默认关闭；开启后按引用的 AI 列进行全列完整性检查",
+    "ref_url": ""
   }
 }

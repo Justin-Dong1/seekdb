@@ -103,7 +103,7 @@ public:
     }
   private:
     sqlclient::ObISQLResultHandler *result_handler_;
-    char buf_[BUF_SIZE];
+    alignas(16) char buf_[BUF_SIZE];
     bool enable_use_result_; // when true, use mysql_use_result() instead of mysql_store_result()
   };
 
