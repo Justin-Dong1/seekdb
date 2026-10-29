@@ -94,6 +94,27 @@ int process_ai_column_group()
     if (ret == OB_ITER_END) { ret = OB_SUCCESS; }
   }
   if (OB_FAIL(ret) || jobs.empty()) { return ret; }
+
+  // A task whose target row is gone must never invoke the model or publish a
+  // value.  Normal DELETE DML removes such tasks transactionally; retaining an
+  // orphan here also lets DROP TABLE perform the authoritative metadata/task
+  // cleanup instead of racing the worker.
+  {
+    ObSqlString exists;
+    OZ(exists.append("SELECT /*+ QUERY_TIMEOUT(1000000) */ 1 FROM "));
+    OZ(ai_identifier(exists, jobs.at(0).database));
+    OZ(exists.append("."));
+    OZ(ai_identifier(exists, jobs.at(0).table));
+    OZ(exists.append_fmt(" WHERE %.*s LIMIT 1",
+        jobs.at(0).predicate.length(), jobs.at(0).predicate.ptr()));
+    alignas(16) ObMySQLProxy::MySQLResult result;
+    OZ(GCTX.sql_proxy_->read(result, exists.ptr()));
+    if (OB_SUCC(ret)) {
+      const int next_ret = result.get_result()->next();
+      if (next_ret == OB_ITER_END) { return OB_ITER_END; }
+      if (next_ret != OB_SUCCESS) { return next_ret; }
+    }
+  }
   int inference_error = OB_SUCCESS;
   for (int64_t i = 0; OB_SUCC(ret) && i < jobs.count(); ++i) {
     auto &job = jobs.at(i);
@@ -131,7 +152,11 @@ int process_ai_column_group()
       OZ(ai_hex(call, ObString(prompt->get_data_length(), prompt->get_data())));
       OZ(call.append(" USING utf8mb4)))"));
     } else { OZ(call.append(expression_text)); }
-    OZ(query.append_fmt("SELECT CAST((%s) AS CHAR) AS ai_result FROM (%.*s) AS ai_input",
+    // Do not hold the statement's AI-model schema guard for the session's
+    // default 10-second timeout.  A down endpoint must release model DDL
+    // quickly so the independent AI-function test suite can create/drop its
+    // models while column retries are pending.
+    OZ(query.append_fmt("SELECT /*+ QUERY_TIMEOUT(1000000) */ CAST((%s) AS CHAR) AS ai_result FROM (%.*s) AS ai_input",
         call.ptr(), job.snapshot.length(), job.snapshot.ptr()));
     alignas(16) ObMySQLProxy::MySQLResult result;
     OZ(GCTX.sql_proxy_->read(result, query.ptr()));

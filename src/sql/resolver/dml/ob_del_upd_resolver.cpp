@@ -507,6 +507,24 @@ int ai_assignment_invalidated(const ObColumnSchemaV2 &column, const ObTableSchem
   }
   return ret;
 }
+
+int mark_ai_vector_index_update(const ObColumnSchemaV2 &column,
+                                const ObTableSchema &table,
+                                ObSchemaGetterGuard &schema_guard,
+                                const bool invalidated,
+                                bool &update_with_vector_index)
+{
+  int ret = OB_SUCCESS;
+  if (invalidated && ob_is_collection_sql_type(column.get_data_type())) {
+    // The user's assignment targets an ordinary dependency column, so the
+    // first vector-index scan cannot see this implicit NULL assignment yet.
+    ObIndexType index_type = INDEX_TYPE_MAX;
+    ret = ObVectorIndexUtil::check_column_has_vector_index(
+        table, schema_guard, column.get_column_id(),
+        update_with_vector_index, index_type);
+  }
+  return ret;
+}
 }
 
 int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment> &assigns,
@@ -560,6 +578,9 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
           //do nothing
         } else if (OB_FAIL(ai_assignment_invalidated(*column_schema, *table_schema,
                                                     assigns.at(i).assignments_, ai_invalidated))) {
+        } else if (OB_FAIL(mark_ai_vector_index_update(*column_schema, *table_schema,
+                                                      *schema_guard, ai_invalidated,
+                                                      update_with_vector_index))) {
         } else if (OB_FAIL(check_need_assignment(assigns.at(i).assignments_,
                                                  table_item->table_id_,
                                                  trigger_exist,
