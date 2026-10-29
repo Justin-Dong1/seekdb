@@ -50,6 +50,27 @@ ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
 
 ObExprTokenize::~ObExprTokenize() {}
 
+ObExprTokenize::ObExprTokenizeCtx::ObExprTokenizeCtx()
+    : ObExprOperatorCtx(),
+      config_allocator_(ObMemAttr("TokenizeCtx")),
+      parser_name_(),
+      properties_(),
+      output_mode_(TokenizeParam::DEFAULT),
+      helper_(),
+      token_map_(),
+      config_cached_(false),
+      helper_inited_(false),
+      token_map_created_(false)
+{
+}
+
+ObExprTokenize::ObExprTokenizeCtx::~ObExprTokenizeCtx()
+{
+  if (token_map_created_) {
+    token_map_.destroy();
+  }
+}
+
 int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &expr_datum)
 {
   int ret = OB_SUCCESS;
@@ -59,12 +80,40 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
 
   ObIJsonBase *json_result = nullptr;
   TokenizeParam param;
+  ObExprTokenizeCtx *tokenize_ctx = nullptr;
+  const bool constant_config = (expr.arg_cnt_ < 2 || expr.args_[1]->is_static_const_)
+                            && (expr.arg_cnt_ < 3 || expr.args_[2]->is_static_const_);
 
   // check param num, which is checked in ObExprOperator::calc_result_typeN.
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (constant_config
+             && OB_ISNULL(tokenize_ctx = static_cast<ObExprTokenizeCtx *>(
+                    ctx.exec_ctx_.get_expr_op_ctx(expr.expr_ctx_id_)))
+             && OB_FAIL(ctx.exec_ctx_.create_expr_op_ctx(expr.expr_ctx_id_, tokenize_ctx))) {
+  } else if (constant_config && tokenize_ctx->config_cached_) {
+    if (OB_FAIL(parse_fulltext(expr, ctx, param))) {
+    } else {
+      param.parser_name_ = tokenize_ctx->parser_name_;
+      param.properties_ = tokenize_ctx->properties_;
+      param.output_mode_ = tokenize_ctx->output_mode_;
+    }
   } else if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
+  } else if (constant_config
+             && (OB_FAIL(ob_write_string(tokenize_ctx->config_allocator_,
+                                         param.parser_name_, tokenize_ctx->parser_name_))
+                 || OB_FAIL(ob_write_string(tokenize_ctx->config_allocator_,
+                                            param.properties_, tokenize_ctx->properties_)))) {
+  } else if (constant_config) {
+    tokenize_ctx->output_mode_ = param.output_mode_;
+    tokenize_ctx->config_cached_ = true;
+  }
+  if (OB_FAIL(ret)) {
+  } else if (constant_config
+             && OB_FAIL(tokenize_fulltext_cached(param, temp_allocator,
+                                                  *tokenize_ctx, json_result))) {
+  } else if (!constant_config
+             && OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
   } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
                                                      ctx,
                                                      temp_allocator,
@@ -72,6 +121,46 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
                                                      expr_datum))) {
   }
 
+  return ret;
+}
+
+int ObExprTokenize::tokenize_fulltext_cached(const TokenizeParam &param,
+                                             ObIAllocator &allocator,
+                                             ObExprTokenizeCtx &tokenize_ctx,
+                                             ObIJsonBase *&result)
+{
+  int ret = OB_SUCCESS;
+  int64_t doc_len = 0;
+  if (!tokenize_ctx.helper_inited_) {
+    if (OB_FAIL(tokenize_ctx.helper_.init(&allocator, param.parser_name_, param.properties_))) {
+    } else {
+      tokenize_ctx.helper_inited_ = true;
+    }
+  } else if (OB_FAIL(tokenize_ctx.helper_.set_allocator(&allocator))) {
+  }
+  if (OB_SUCC(ret) && !tokenize_ctx.token_map_created_) {
+    const int64_t bucket_count = MIN(MAX(param.fulltext_.length() / 2, 2), 997);
+    if (OB_FAIL(tokenize_ctx.token_map_.create(bucket_count, common::ObMemAttr("FTWordMap")))) {
+    } else {
+      tokenize_ctx.token_map_created_ = true;
+    }
+  }
+  if (OB_SUCC(ret) && !param.fulltext_.empty()
+      && OB_FAIL(tokenize_ctx.helper_.segment(param.meta_, param.fulltext_.ptr(),
+                                              param.fulltext_.length(), doc_len,
+                                              tokenize_ctx.token_map_))) {
+  } else if (OB_SUCC(ret) && param.fulltext_.empty()) {
+    ret = tokenize_ctx.token_map_.reuse();
+  }
+  if (OB_SUCC(ret)) {
+    if (TokenizeParam::DEFAULT == param.output_mode_) {
+      ret = tokenize_ctx.helper_.make_token_array_json(tokenize_ctx.token_map_, result);
+    } else if (TokenizeParam::ALL == param.output_mode_) {
+      ret = tokenize_ctx.helper_.make_detail_json(tokenize_ctx.token_map_, doc_len, result);
+    } else {
+      ret = OB_INVALID_ARGUMENT;
+    }
+  }
   return ret;
 }
 

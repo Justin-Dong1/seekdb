@@ -358,6 +358,19 @@ void ObFTParseHelper::reset()
   is_inited_ = false;
 }
 
+int ObFTParseHelper::set_allocator(common::ObIAllocator *allocator)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_ISNULL(allocator)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    allocator_ = allocator;
+  }
+  return ret;
+}
+
 int ObFTParseHelper::segment(
     const ObObjMeta &meta,
     const char *fulltext,

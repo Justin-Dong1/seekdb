@@ -61,3 +61,32 @@ official score. The full fixed 20,000-document Linux benchmark has not been run
 locally against this build. Official index-build, TOKENIZE and MATCH performance
 and integration correctness still require the competition evaluator. Benchmark
 inputs, SQL, scoring scripts, and baseline files are unchanged.
+
+## TOKENIZE execution-context reuse
+
+The generated full-text columns and the SQL `TOKENIZE` function previously
+rebuilt the same parser configuration, repeated the IK dictionary readiness
+check, and allocated a new token hash table for every evaluated row. Constant
+parser arguments are now copied once into the expression execution context.
+The initialized parser helper and a correctly sized hash table are reused while
+row-local token memory still comes from the current evaluation allocator.
+Dynamic parser arguments retain the original path.
+
+The official 20,000-row benchmark was run before and after this change on the
+same Windows x64 host, optimized build, and fresh seekdb instances. Query hit
+counts were unchanged (8,001 Chinese, 11,000 English, 7,332 mixed, and 20 with
+LIMIT). Relevant timings were:
+
+| Metric | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| IK title + content build | 6.319 s | 6.127 s | -3.0% |
+| IK content build | 4.957 s | 4.842 s | -2.3% |
+| BENG English build | 2.423 s | 2.448 s | +1.0% |
+| IK TOKENIZE | 0.2954 ms | 0.2868 ms | -2.9% |
+| BENG TOKENIZE | 0.1966 ms | 0.1971 ms | +0.3% |
+
+The first prototype used a fixed 997-bucket table and regressed short
+`TOKENIZE` inputs. The final implementation preserves the original
+text-length-based bucket sizing while reusing the allocated table. Full builds,
+the benchmark's SQL correctness checks, and the existing token hot-path tests
+passed with the final implementation.

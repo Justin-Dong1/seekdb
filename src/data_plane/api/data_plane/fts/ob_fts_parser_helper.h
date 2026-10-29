@@ -180,6 +180,7 @@ public:
       const common::ObString &parser_name,
       const common::ObString &parser_properties,
       bool &is_same) const;
+  int set_allocator(common::ObIAllocator *allocator);
   /**
    * Make json document for fulltext search
    *
