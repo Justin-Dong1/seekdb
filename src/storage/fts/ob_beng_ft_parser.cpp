@@ -19,6 +19,8 @@
 #include "storage/fts/ob_beng_ft_parser.h"
 #include "data_plane/fts/ob_fts_struct.h"
 
+#include <cstdint>
+
 using namespace oceanbase::common;
 
 namespace oceanbase
@@ -35,6 +37,7 @@ int ObBEngFTParser::get_next_token(
   int ret = OB_SUCCESS;
   ObDatum token;
   int64_t token_freq = 0;
+  char *buf = nullptr;
   word = nullptr;
   word_len = 0;
   char_len = 0;
@@ -49,14 +52,29 @@ int ObBEngFTParser::get_next_token(
   } else if (OB_ISNULL(token.ptr_) || OB_UNLIKELY(0 >= token.len_ || 0 >= token_freq)) {
     ret = OB_INVALID_ARGUMENT;
   } else {
-    // The parse helper consumes this token before requesting the next one.
-    // The analyzer owns the normalized bytes until that next get_next() call,
-    // so allocating and copying every token here only adds hot-path work.
-    word = token.ptr_;
-    word_len = token.len_;
-    char_len = token.len_;
-    word_freq = token_freq;
-    LOG_DEBUG("succeed to add word", K(ObString(word_len, word)), K(word_freq));
+    const uintptr_t doc_addr = reinterpret_cast<uintptr_t>(doc_.ptr_);
+    const uintptr_t token_addr = reinterpret_cast<uintptr_t>(token.ptr_);
+    const bool token_in_doc = token_addr >= doc_addr
+        && token.len_ <= doc_.len_
+        && token_addr - doc_addr <= doc_.len_ - token.len_;
+    if (token_in_doc) {
+      // Lowercase ASCII normalization can return a stable slice of the input
+      // document.  It remains valid for the complete parse and needs no copy.
+      word = token.ptr_;
+    } else if (OB_ISNULL(buf = static_cast<char *>(allocator_.alloc(token.len_)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      // Charset case conversion uses a scratch allocator that is reused by
+      // the next token.  Persist those tokens before inserting map keys.
+      MEMCPY(buf, token.ptr_, token.len_);
+      word = buf;
+    }
+    if (OB_SUCC(ret)) {
+      word_len = token.len_;
+      char_len = token.len_;
+      word_freq = token_freq;
+      LOG_DEBUG("succeed to add word", K(ObString(word_len, word)), K(word_freq));
+    }
   }
   return ret;
 }

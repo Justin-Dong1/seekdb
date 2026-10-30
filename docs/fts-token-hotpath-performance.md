@@ -115,11 +115,9 @@ number checks avoid a second Unicode decode; multibyte and fullwidth characters
 continue through the original helpers. Processor dispatch, token ordering,
 dictionary access, and benchmark inputs remain unchanged.
 
-The BENG parser also stops allocating and copying every normalized English
-token a second time. Its caller consumes each token synchronously before the
-analyzer advances, and the analyzer retains the normalized buffer until that
-next call. Returning the existing buffer therefore preserves the iterator
-lifetime contract while removing one allocation and one `memcpy` per token.
-Already-lowercase ASCII tokens now also reuse their trimmed input slice instead
-of allocating a case-conversion buffer; uppercase and non-ASCII tokens retain
-the existing charset-aware lowercase conversion.
+Already-lowercase ASCII BENG tokens reuse their stable trimmed input slice in
+both the normalizer and parser. Uppercase and non-ASCII tokens retain the
+charset-aware lowercase conversion and are copied from its reusable scratch
+buffer into the parse allocator before becoming word-map keys. This ownership
+check is required because word-map entries outlive the analyzer's next-token
+scratch buffer.
