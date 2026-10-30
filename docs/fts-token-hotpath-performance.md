@@ -105,3 +105,21 @@ the mixed Chinese/English benchmark corpus. An exhaustive comparison covered all
 1,114,112 Unicode code points with no classification differences. The affected
 storage FTS compilation unit builds successfully. No local database executable
 was launched; end-to-end timing remains the official evaluator's responsibility.
+
+The follow-up revision moves additional immutable metadata out of both IK text
+passes. `TokenizeContext` now resolves and validates its charset descriptor once,
+then reuses it for the primary scan and the arbitrator's output scan. This removes
+per-character collation mapping and repeated charset table lookup while retaining
+the same `well_formed_len` validation callback. UTF-8 ASCII connector and Chinese
+number checks avoid a second Unicode decode; multibyte and fullwidth characters
+continue through the original helpers. Processor dispatch, token ordering,
+dictionary access, and benchmark inputs remain unchanged.
+
+The BENG parser also stops allocating and copying every normalized English
+token a second time. Its caller consumes each token synchronously before the
+analyzer advances, and the analyzer retains the normalized buffer until that
+next call. Returning the existing buffer therefore preserves the iterator
+lifetime contract while removing one allocation and one `memcpy` per token.
+Already-lowercase ASCII tokens now also reuse their trimmed input slice instead
+of allocating a case-conversion buffer; uppercase and non-ASCII tokens retain
+the existing charset-aware lowercase conversion.

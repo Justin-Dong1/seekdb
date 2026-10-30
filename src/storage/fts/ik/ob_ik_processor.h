@@ -47,10 +47,15 @@ public:
 
   int current_char(const char *&ch, uint8_t &char_len);
   int current_char_type(ObFTCharUtil::CharType &type);
+  int first_valid_char_at(int64_t offset, int64_t &char_len) const;
+  int classify_char_at(int64_t offset,
+                       int64_t &char_len,
+                       ObFTCharUtil::CharType &type) const;
 
   int step_next();
 
   ObCollationType collation() const;
+  ObCharsetType charset_type() const;
   int64_t get_end_cursor() const;
   const char *fulltext() const;
   int64_t fulltext_len() const;
@@ -77,6 +82,8 @@ private:
   int prepare_next_char();
 
   ObCollationType coll_type_;
+  ObCharsetType charset_type_;
+  const ObCharsetInfo *charset_;
   const char *fulltext_;
   int64_t fulltext_len_;
 
