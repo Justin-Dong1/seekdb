@@ -156,6 +156,11 @@ double ObExprBM25::query_token_weight(const int64_t doc_freq, const int64_t doc_
   // Since we might use approximate count statistic for total doc cnt, possibilities there are
   //   document frequencies larger than total doc cnt
   const double diff = (len - df) > 0 ? (len - df) : 0;
+  // For a nonnegative frequency with numerator <= denominator, log is <= 0
+  // and the existing positive epsilon floor determines the exact result.
+  if (df >= 0 && diff <= df) {
+    return p_epsilon * (1.0 + p_k1);
+  }
   const double idf = std::log((diff + 0.5) / (df + 0.5));
   return MAX(p_epsilon, idf) * (1.0 + p_k1);
 }

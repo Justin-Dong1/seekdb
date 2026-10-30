@@ -147,6 +147,12 @@ protected:
   sql::ObExpr *token_weight_expr_;
   sql::ObBitVector *skip_;
   int64_t token_doc_cnt_;
+  // This weight is a pure function of these two counts. Keying both values
+  // also makes reuse/rescan safe without retaining any row or snapshot data.
+  int64_t weight_doc_freq_ = 0;
+  int64_t weight_doc_count_ = 0;
+  double cached_token_weight_ = 0;
+  bool token_weight_cached_ = false;
   int64_t max_batch_size_;
   bool need_inv_idx_agg_;
   bool inv_idx_agg_evaluated_;

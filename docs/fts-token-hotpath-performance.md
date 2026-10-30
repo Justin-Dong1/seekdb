@@ -90,3 +90,21 @@ The first prototype used a fixed 997-bucket table and regressed short
 text-length-based bucket sizing while reusing the allocated table. Full builds,
 the benchmark's SQL correctness checks, and the existing token hot-path tests
 passed with the final implementation.
+
+## Retrieval weight reuse (2026-10-30)
+
+The preceding IK revision passed platform correctness but scored zero:
+fts_mean_improvement=-0.04018980112848624, build_total_sec=15.108,
+query_cn_avg_ms=1.4807, query_beng_avg_ms=2.1601. This is not evidence of an
+end-to-end speedup; timings in unchanged operations also increased.
+
+Retrieval iterators now retain the BM25 query weight keyed by both document
+frequency and total document count. Any count change recomputes the value,
+including reuse/rescan. No result rows or cross-query database state are cached.
+For nonnegative frequencies where the logarithm is nonpositive, query weight
+returns the existing epsilon floor directly, preserving the formula exactly.
+
+Both changed SQL compilation units compile. A numerical comparison of the old
+and new formula passed 1,151,650 count pairs including frequency > document
+count and 64-bit boundary-scale values. This is a formula check, not a server
+integration benchmark; official timing remains pending. No server was launched.

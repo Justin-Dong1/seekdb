@@ -658,8 +658,14 @@ int ObDASTextRetrievalIter::fill_token_weight()
     guard.set_batch_idx(0);
     ObDatum &token_weight_datum =
         token_weight_expr_->locate_datum_for_write(*ir_rtdef_->eval_ctx_);
-    token_weight_datum.set_double(
-        sql::ObExprBM25::query_token_weight(token_doc_cnt_, total_doc_cnt));
+    if (!token_weight_cached_ || weight_doc_freq_ != token_doc_cnt_
+        || weight_doc_count_ != total_doc_cnt) {
+      cached_token_weight_ = sql::ObExprBM25::query_token_weight(token_doc_cnt_, total_doc_cnt);
+      weight_doc_freq_ = token_doc_cnt_;
+      weight_doc_count_ = total_doc_cnt;
+      token_weight_cached_ = true;
+    }
+    token_weight_datum.set_double(cached_token_weight_);
   }
   return ret;
 }
