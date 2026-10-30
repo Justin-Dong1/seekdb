@@ -102,7 +102,17 @@ int TokenizeContext::current_char_type(ObFTCharUtil::CharType &type)
 int TokenizeContext::prepare_next_char()
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(ObCharset::first_valid_char(coll_type_,
+  const unsigned char byte = static_cast<unsigned char>(fulltext_[cursor_]);
+  if (byte < 0x80 && ObCharset::charset_type_by_coll(coll_type_) == CHARSET_UTF8MB4) {
+    // ASCII bytes are complete UTF-8 characters; avoid charset validation and
+    // Unicode decoding for the common letters, numbers and delimiters.
+    next_char_len_ = 1;
+    next_char_type_ = ObUnicodeBlockUtils::is_alpha(byte)
+        ? ObFTCharUtil::CharType::ENGLISH_LETTER
+        : ObUnicodeBlockUtils::is_arabic(byte)
+            ? ObFTCharUtil::CharType::ARABIC_LETTER
+            : ObFTCharUtil::CharType::USELESS;
+  } else if (OB_FAIL(ObCharset::first_valid_char(coll_type_,
                                           fulltext_ + cursor_,
                                           fulltext_len_ - cursor_,
                                           next_char_len_))) {

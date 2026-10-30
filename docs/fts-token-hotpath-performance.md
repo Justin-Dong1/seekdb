@@ -90,3 +90,20 @@ The first prototype used a fixed 997-bucket table and regressed short
 text-length-based bucket sizing while reusing the allocated table. Full builds,
 the benchmark's SQL correctness checks, and the existing token hot-path tests
 passed with the final implementation.
+
+## IK character pipeline (2026-10-30)
+
+The character classifier now decodes each input once rather than repeating the
+same Unicode decode in up to six category predicates. Category precedence and
+UTF-16-only surrogate classification are preserved. The IK main loop passes its
+already-read character and category to processors rather than making every
+processor fetch both again. UTF-8 ASCII input uses a one-byte path; non-ASCII
+and other encodings retain the existing validation path.
+
+The standalone component executable passes the original three regression groups
+and classification checks for all 1,112,064 valid Unicode scalar values, plus
+cursor checks for all 128 ASCII bytes. This is not an end-to-end speed result.
+No database server was started for this revision. MATCH result equivalence and
+index-build/query timings still require the official evaluator. The previous
+platform score was 2.632, with build_total_sec=14.605 and tokenize_ik_avg_ms=0.0754.
+Benchmark SQL, datasets, expected results and scoring rules remain unchanged.

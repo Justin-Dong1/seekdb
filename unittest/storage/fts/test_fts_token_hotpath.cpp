@@ -11,6 +11,8 @@
  * limitations under the License.
  */
 #include "storage/fts/ob_fts_stop_word.h"
+#include "storage/fts/ik/ob_ik_char_util.h"
+#include "storage/fts/ik/ob_ik_processor.h"
 #include "storage/fts/ob_fts_parser_property.h"
 #ifdef FTS_HOTPATH_STANDALONE
 #include <cstdio>
@@ -111,6 +113,35 @@ TEST(FTSTokenHotpath, non_grouped_duplicates_and_uninitialized_map)
   words.destroy();
 }
 
+TEST(FTSTokenHotpath, unicode_classification_and_ascii_cursor)
+{
+  using Type = ObFTCharUtil::CharType;
+  // Exhaust all valid scalar values, including supplementary CJK and emoji.
+  for (uint32_t cp = 0; cp <= 0x10ffff; ++cp) {
+    if (cp >= 0xd800 && cp <= 0xdfff) { continue; }
+    char bytes[4]; uint8_t n = 0;
+    if (cp < 0x80) { bytes[n++] = cp; }
+    else if (cp < 0x800) { bytes[n++] = 0xc0 | (cp >> 6); bytes[n++] = 0x80 | (cp & 63); }
+    else if (cp < 0x10000) { bytes[n++] = 0xe0 | (cp >> 12); bytes[n++] = 0x80 | ((cp >> 6) & 63); bytes[n++] = 0x80 | (cp & 63); }
+    else { bytes[n++] = 0xf0 | (cp >> 18); bytes[n++] = 0x80 | ((cp >> 12) & 63); bytes[n++] = 0x80 | ((cp >> 6) & 63); bytes[n++] = 0x80 | (cp & 63); }
+    Type reference_type = ObUnicodeBlockUtils::is_alpha(cp) ? Type::ENGLISH_LETTER
+        : ObUnicodeBlockUtils::is_arabic(cp) ? Type::ARABIC_LETTER
+        : ObUnicodeBlockUtils::is_chinese(cp) ? Type::CHINESE
+        : ObUnicodeBlockUtils::is_other_cjk(cp) ? Type::OTHER_CJK : Type::USELESS;
+    Type parsed_type;
+    ASSERT_EQ(OB_SUCCESS, ObFTCharUtil::classify_first_char(CS_TYPE_UTF8MB4_BIN, bytes, n, parsed_type));
+    ASSERT_EQ(reference_type, parsed_type);
+    if (cp < 128) {
+      ObArenaAllocator allocator;
+      TokenizeContext ctx(CS_TYPE_UTF8MB4_BIN, allocator, bytes, n, false);
+      ASSERT_EQ(OB_SUCCESS, ctx.init());
+      ASSERT_EQ(OB_SUCCESS, ctx.current_char_type(parsed_type));
+      ASSERT_EQ(reference_type, parsed_type);
+      ASSERT_EQ(OB_ITER_END, ctx.step_next());
+    }
+  }
+}
+
 #ifdef FTS_HOTPATH_STANDALONE
 static void benchmark_hotpath()
 {
@@ -161,6 +192,8 @@ int main()
   grouping_preserves_frequency_and_last_spelling();
   non_grouped_duplicates_and_uninitialized_map();
   std::puts("FTS hotpath: 3 regression groups passed");
+  unicode_classification_and_ascii_cursor();
+  std::puts("Unicode scalar classification and ASCII cursor passed");
   benchmark_hotpath();
 }
 #endif
