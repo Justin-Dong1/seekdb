@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "config_bridge.h"
 #include "common/ob_timeout_ctx.h"
+#include "common/mysqlclient/ob_mysql_result.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "share/ob_server_struct.h"
 #include "sql/engine/cmd/ob_table_executor.h"
@@ -150,15 +151,61 @@ int build_ai_retry_predicate(const ObString &statement,
   return ret;
 }
 
+int retire_ai_column_retry_tasks(ObMySQLTransaction &transaction,
+                                 const ObSqlString &qualified_table,
+                                 const ObSqlString &predicate,
+                                 const uint64_t table_id,
+                                 const uint64_t column_id)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator allocator("AiRetryTasks");
+  ObSEArray<ObString, 4> task_ids, row_predicates;
+  ObSqlString select;
+  OZ(select.append_fmt("SELECT task_id,rowkey_predicate FROM oceanbase.__all_ai_column_task "
+                       "WHERE table_id=%lu AND column_id=%lu", table_id, column_id));
+  {
+    alignas(16) ObMySQLProxy::MySQLResult result;
+    OZ(transaction.read(result, select.ptr()));
+    while (OB_SUCC(ret)) {
+      if (OB_FAIL(result.get_result()->next())) { break; }
+      ObString task, row, task_copy, row_copy;
+      OZ(result.get_result()->get_varchar("task_id", task));
+      OZ(result.get_result()->get_varchar("rowkey_predicate", row));
+      OZ(ob_write_string(allocator, task, task_copy));
+      OZ(ob_write_string(allocator, row, row_copy));
+      OZ(task_ids.push_back(task_copy));
+      OZ(row_predicates.push_back(row_copy));
+    }
+    if (ret == OB_ITER_END) { ret = OB_SUCCESS; }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < task_ids.count(); ++i) {
+    // Evaluate the stored row identity instead of comparing its SQL text:
+    // DML and RETRY may spell the same numeric key as 1 and '1'.
+    ObSqlString remove;
+    int64_t affected = 0;
+    OZ(remove.append("DELETE FROM oceanbase.__all_ai_column_task WHERE task_id="));
+    OZ(append_ai_retry_literal(remove, task_ids.at(i)));
+    OZ(remove.append_fmt(" AND EXISTS (SELECT 1 FROM %s WHERE (%s) AND (%.*s))",
+        qualified_table.ptr(), predicate.ptr(),
+        row_predicates.at(i).length(), row_predicates.at(i).ptr()));
+    OZ(transaction.write(remove.ptr(), affected));
+  }
+  return ret;
+}
+
 int execute_ai_column_retry(ObExecContext &ctx, ObAlterTableStmt &stmt, const ObString &first_stmt)
 {
   int ret = OB_SUCCESS;
   const ObTableSchema *table = NULL;
   const ObColumnSchemaV2 *ai_column = NULL;
-  ObSchemaGetterGuard *guard = ctx.get_sql_ctx() == NULL ? NULL : ctx.get_sql_ctx()->schema_guard_;
-  if (OB_ISNULL(guard) || OB_ISNULL(ctx.get_sql_proxy())) {
+  // A DDL executor can run after its compilation guard has been released.
+  // Own a fresh guard for the complete retry operation, including schema use
+  // while constructing and executing the task transaction.
+  ObSchemaGetterGuard schema_guard;
+  if (OB_ISNULL(GCTX.schema_service_) || OB_ISNULL(ctx.get_sql_proxy())) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (OB_FAIL(guard->get_table_schema(stmt.get_alter_table_schema().get_table_id(), table))) {
+  } else if (OB_FAIL(GCTX.schema_service_->get_runtime_schema_guard(schema_guard))) {
+  } else if (OB_FAIL(schema_guard.get_table_schema(stmt.get_alter_table_schema().get_table_id(), table))) {
   } else if (OB_ISNULL(table)
              || OB_ISNULL(ai_column = table->get_column_schema(stmt.get_ai_column_retry_name()))
              || !ai_column->is_ai_column()) {
@@ -205,18 +252,10 @@ int execute_ai_column_retry(ObExecContext &ctx, ObAlterTableStmt &stmt, const Ob
     OZ(transaction.start(ctx.get_sql_proxy()));
   }
   if (OB_SUCC(ret)) {
-    // Replace pending retries in the same transaction as invalidating the
-    // result. The worker rechecks task_id before publishing: deleting the old
-    // task therefore prevents an in-flight failure from overwriting a newer
-    // successful retry for the same row and column.
-    ObSqlString delete_sql;
-    OZ(delete_sql.append("DELETE q FROM oceanbase.__all_ai_column_task q JOIN "));
-    OZ(delete_sql.append(qualified_table.string()));
-    OZ(delete_sql.append_fmt(" t ON q.table_id=%lu AND q.column_id=%lu AND q.rowkey_predicate=",
-                            table->get_table_id(), ai_column->get_column_id()));
-    OZ(delete_sql.append(rowkey_expr.string()));
-    OZ(delete_sql.append_fmt(" WHERE (%s)", predicate.ptr()));
-    OZ(transaction.write(delete_sql.ptr(), affected_rows));
+    // Retire prior versions before enqueuing replacements. The worker rechecks
+    // task identities under lock, so an in-flight old result cannot publish.
+    OZ(retire_ai_column_retry_tasks(transaction, qualified_table, predicate,
+                                    table->get_table_id(), ai_column->get_column_id()));
   }
   if (OB_SUCC(ret)) {
     ObSqlString insert_sql;
