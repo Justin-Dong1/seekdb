@@ -108,3 +108,15 @@ Both changed SQL compilation units compile. A numerical comparison of the old
 and new formula passed 1,151,650 count pairs including frequency > document
 count and 64-bit boundary-scale values. This is a formula check, not a server
 integration benchmark; official timing remains pending. No server was launched.
+
+## IK processor dispatch reuse (2026-10-31)
+
+The IK main loop already reads the current byte span and its character type once
+before dispatching to the four stateful processors. Those exact values are now
+passed to each processor instead of being fetched twice per processor from the
+same context. Processor order and state transitions are unchanged. This isolated
+change deliberately excludes the earlier ASCII shortcut from the zero-score
+revision so that the known 3.752-point character-classifier baseline is kept.
+The four fixed processor pointers also live in inline contiguous storage rather
+than separately allocated list nodes, removing pointer chasing from the same
+per-character loop without changing processor lifetime or order.
