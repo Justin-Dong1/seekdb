@@ -163,7 +163,7 @@ int execute_ai_column_retry(ObExecContext &ctx, ObAlterTableStmt &stmt, const Ob
              || OB_ISNULL(ai_column = table->get_column_schema(stmt.get_ai_column_retry_name()))
              || !ai_column->is_ai_column()) {
     ret = OB_NOT_SUPPORTED;
-    LOG_USER_ERROR(OB_NOT_SUPPORTED, "RETRY target must be exactly one AI COLUMN");
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "retrying a column that is not an AI column");
   }
 
   ObSqlString qualified_table, state_name, predicate, rowkey_expr, snapshot_prefix;
