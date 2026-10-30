@@ -205,6 +205,20 @@ int execute_ai_column_retry(ObExecContext &ctx, ObAlterTableStmt &stmt, const Ob
     OZ(transaction.start(ctx.get_sql_proxy()));
   }
   if (OB_SUCC(ret)) {
+    // Replace pending retries in the same transaction as invalidating the
+    // result. The worker rechecks task_id before publishing: deleting the old
+    // task therefore prevents an in-flight failure from overwriting a newer
+    // successful retry for the same row and column.
+    ObSqlString delete_sql;
+    OZ(delete_sql.append("DELETE q FROM oceanbase.__all_ai_column_task q JOIN "));
+    OZ(delete_sql.append(qualified_table.string()));
+    OZ(delete_sql.append_fmt(" t ON q.table_id=%lu AND q.column_id=%lu AND q.rowkey_predicate=",
+                            table->get_table_id(), ai_column->get_column_id()));
+    OZ(delete_sql.append(rowkey_expr.string()));
+    OZ(delete_sql.append_fmt(" WHERE (%s)", predicate.ptr()));
+    OZ(transaction.write(delete_sql.ptr(), affected_rows));
+  }
+  if (OB_SUCC(ret)) {
     ObSqlString insert_sql;
     OZ(insert_sql.append("INSERT INTO oceanbase.__all_ai_column_task "
         "(task_id,table_id,column_id,schema_version,request_id,rowkey_predicate,"
