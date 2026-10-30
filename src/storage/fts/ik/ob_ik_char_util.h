@@ -447,15 +447,37 @@ inline int ObFTCharUtil::do_classify(const char *input, const uint8_t char_len, 
   int ret = OB_SUCCESS;
   ob_wc_t unicode = 0;
   type = CharType::USELESS;
-  // Decode once: the predicates share the same input and classification precedence.
+  // Decode once and classify inline.  The general Unicode helpers are
+  // out-of-line functions; calling up to four of them for every input
+  // character is measurable in index builds and query tokenization.  Keep
+  // their exact ranges and the original precedence here.
   if (OB_FAIL(decode_unicode<CS_TYPE>(input, char_len, unicode))) {
-  } else if (ObUnicodeBlockUtils::is_alpha(unicode)) {
+  } else if (unicode <= 0x7F) {
+    // The benchmark corpus, and typical mixed text, contains many ASCII
+    // letters, digits, spaces and punctuation.  Resolve that complete block
+    // before testing any CJK ranges.
+    if ((unicode >= 0x41 && unicode <= 0x5A)
+        || (unicode >= 0x61 && unicode <= 0x7A)) {
+      type = CharType::ENGLISH_LETTER;
+    } else if (unicode >= 0x30 && unicode <= 0x39) {
+      type = CharType::ARABIC_LETTER;
+    }
+  } else if ((unicode >= 0xFF21 && unicode <= 0xFF3A)
+             || (unicode >= 0xFF41 && unicode <= 0xFF5A)) {
     type = CharType::ENGLISH_LETTER;
-  } else if (ObUnicodeBlockUtils::is_arabic(unicode)) {
+  } else if (unicode >= 0xFF10 && unicode <= 0xFF19) {
     type = CharType::ARABIC_LETTER;
-  } else if (ObUnicodeBlockUtils::is_chinese(unicode)) {
+  } else if ((unicode >= 0x4E00 && unicode <= 0x9FFF)
+             || (unicode >= 0xF900 && unicode <= 0xFAFF)
+             || (unicode >= 0x3400 && unicode <= 0x4DBF)) {
     type = CharType::CHINESE;
-  } else if (ObUnicodeBlockUtils::is_other_cjk(unicode)) {
+  } else if ((unicode >= 0xFF00 && unicode <= 0xFFEF)
+             || (unicode >= 0xAC00 && unicode <= 0xD7AF)
+             || (unicode >= 0x1100 && unicode <= 0x11FF)
+             || (unicode >= 0x3130 && unicode <= 0x318F)
+             || (unicode >= 0x3040 && unicode <= 0x309F)
+             || (unicode >= 0x30A0 && unicode <= 0x30FF)
+             || (unicode >= 0x31F0 && unicode <= 0x31FF)) {
     type = CharType::OTHER_CJK;
   } else if (CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE) {
     if (ObUnicodeBlockUtils::check_high_surrogate(unicode)) {

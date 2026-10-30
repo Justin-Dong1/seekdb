@@ -90,3 +90,18 @@ The first prototype used a fixed 997-bucket table and regressed short
 text-length-based bucket sizing while reusing the allocated table. Full builds,
 the benchmark's SQL correctness checks, and the existing token hot-path tests
 passed with the final implementation.
+
+## Inline IK character classification (2026-10-31)
+
+The last known-good competition revision scored 3.752 after decoding every IK
+input character once. Two later submissions that bypassed the processor wrapper
+both scored zero, so that dispatch change and the unrelated BM25 cache are not
+included in this branch.
+
+This revision keeps the known-good parser pipeline and only removes out-of-line
+Unicode range helper calls from the already-decoded classifier. The same ranges
+and precedence are evaluated inline, with a complete ASCII block fast path for
+the mixed Chinese/English benchmark corpus. An exhaustive comparison covered all
+1,114,112 Unicode code points with no classification differences. The affected
+storage FTS compilation unit builds successfully. No local database executable
+was launched; end-to-end timing remains the official evaluator's responsibility.
