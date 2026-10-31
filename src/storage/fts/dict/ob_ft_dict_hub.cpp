@@ -18,6 +18,7 @@
 
 #include "storage/fts/dict/ob_ft_dict_hub.h"
 
+#include "lib/atomic/ob_atomic.h"
 #include "lib/ob_errno.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/utility/ob_macro_utils.h"
@@ -43,6 +44,25 @@ int ObFTDictHub::init()
 int ObFTDictHub::destroy()
 {
   int ret = OB_SUCCESS;
+  if (OB_NOT_NULL(shared_set_)) {
+    if (OB_NOT_NULL(shared_set_->main_dict_)) {
+      shared_set_->main_dict_->~ObIFTDict();
+      shared_set_->main_dict_ = nullptr;
+    }
+    if (OB_NOT_NULL(shared_set_->quan_dict_)) {
+      shared_set_->quan_dict_->~ObIFTDict();
+      shared_set_->quan_dict_ = nullptr;
+    }
+    if (OB_NOT_NULL(shared_set_->stop_dict_)) {
+      shared_set_->stop_dict_->~ObIFTDict();
+      shared_set_->stop_dict_ = nullptr;
+    }
+    shared_set_->main_container_.reset();
+    shared_set_->quan_container_.reset();
+    shared_set_->stop_container_.reset();
+    shared_set_ = nullptr;
+  }
+  shared_alloc_.reset();
   is_inited_ = false;
   return ret;
 }
@@ -76,6 +96,8 @@ int ObFTDictHub::build_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &
         if (OB_FAIL(ObFTRangeDict::build_cache_from_ik_dict(desc, container))) {
         } else if (FALSE_IT(info.range_count_ = container.get_handles().size())) {
         } else if (OB_FAIL(put_dict_info(key, info))) {
+        } else {
+          ATOMIC_INC(&dict_version_);
         }
       }
     }
@@ -134,6 +156,91 @@ int ObFTDictHub::put_dict_info(const ObFTDictInfoKey &key, const ObFTDictInfo &i
   if (OB_FAIL(dict_map_.set_refactored(key, info, cover_exist_flag))) {
   }
 
+  return ret;
+}
+
+int ObFTDictHub::build_shared_dict(const ObFTDictDesc &desc,
+                                   ObFTCacheRangeContainer &container,
+                                   ObIFTDict *&dict)
+{
+  int ret = OB_SUCCESS;
+  dict = nullptr;
+  if (OB_FAIL(load_cache(desc, container))) {
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      if (OB_FAIL(build_cache(desc, container))) {
+        STORAGE_FTS_LOG(WARN, "Failed to build dict cache", K(ret), K(desc.type_));
+      }
+    } else {
+      STORAGE_FTS_LOG(WARN, "Failed to load dict cache", K(ret), K(desc.type_));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_ISNULL(dict = OB_NEWx(ObFTRangeDict,
+                                 &shared_alloc_,
+                                 shared_alloc_,
+                                 &container,
+                                 desc))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(dict->init())) {
+      OB_DELETEx(ObIFTDict, &shared_alloc_, dict);
+      dict = nullptr;
+    }
+  }
+  return ret;
+}
+
+int ObFTDictHub::get_shared_dicts(ObIFTDict *&main_dict,
+                                  ObIFTDict *&quan_dict,
+                                  ObIFTDict *&stop_dict)
+{
+  int ret = OB_SUCCESS;
+  main_dict = nullptr;
+  quan_dict = nullptr;
+  stop_dict = nullptr;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+  } else {
+    lib::ObMutexGuard guard(shared_lock_);
+    const uint64_t version = ATOMIC_LOAD(&dict_version_);
+    if (OB_ISNULL(shared_set_) || shared_set_->version_ != version) {
+      ObFTSharedDictSet *set = nullptr;
+      if (OB_ISNULL(set = OB_NEWx(ObFTSharedDictSet, &shared_alloc_, shared_alloc_))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        ObFTDictDesc main_dict_desc("main_dict",
+                                    ObFTDictType::DICT_IK_MAIN,
+                                    ObCharsetType::CHARSET_UTF8MB4,
+                                    ObCollationType::CS_TYPE_UTF8MB4_BIN);
+        ObFTDictDesc quan_dict_desc("quan_dict",
+                                    ObFTDictType::DICT_IK_QUAN,
+                                    ObCharsetType::CHARSET_UTF8MB4,
+                                    ObCollationType::CS_TYPE_UTF8MB4_BIN);
+        ObFTDictDesc stop_dict_desc("stopword",
+                                    ObFTDictType::DICT_IK_STOP,
+                                    ObCharsetType::CHARSET_UTF8MB4,
+                                    ObCollationType::CS_TYPE_UTF8MB4_BIN);
+        if (OB_FAIL(build_shared_dict(main_dict_desc,
+                                      set->main_container_,
+                                      set->main_dict_))) {
+        } else if (OB_FAIL(build_shared_dict(quan_dict_desc,
+                                             set->quan_container_,
+                                             set->quan_dict_))) {
+        } else if (OB_FAIL(build_shared_dict(stop_dict_desc,
+                                             set->stop_container_,
+                                             set->stop_dict_))) {
+        } else {
+          // A previous set is intentionally kept alive: readers may still use it.
+          set->version_ = ATOMIC_LOAD(&dict_version_);
+          shared_set_ = set;
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      main_dict = shared_set_->main_dict_;
+      quan_dict = shared_set_->quan_dict_;
+      stop_dict = shared_set_->stop_dict_;
+    }
+  }
   return ret;
 }
 } //  namespace storage

@@ -17,8 +17,11 @@
 #ifndef _OCEANBASE_STORAGE_FTS_DICT_OB_FT_DICT_HUB_H_
 #define _OCEANBASE_STORAGE_FTS_DICT_OB_FT_DICT_HUB_H_
 
+#include "lib/allocator/page_arena.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/lock/ob_bucket_lock.h"
+#include "lib/lock/ob_mutex.h"
+#include "storage/fts/dict/ob_ft_cache_container.h"
 #include "storage/fts/dict/ob_ft_dict_def.h"
 
 namespace oceanbase
@@ -93,10 +96,37 @@ private:
 };
 
 class ObFTCacheRangeContainer;
+class ObIFTDict;
 class ObFTDictHub
 {
+private:
+  struct ObFTSharedDictSet
+  {
+    explicit ObFTSharedDictSet(ObIAllocator &alloc)
+        : main_container_(alloc), quan_container_(alloc), stop_container_(alloc),
+          main_dict_(nullptr), quan_dict_(nullptr), stop_dict_(nullptr), version_(0)
+    {
+    }
+    ObFTCacheRangeContainer main_container_;
+    ObFTCacheRangeContainer quan_container_;
+    ObFTCacheRangeContainer stop_container_;
+    ObIFTDict *main_dict_;
+    ObIFTDict *quan_dict_;
+    ObIFTDict *stop_dict_;
+    uint64_t version_;
+  };
+
 public:
-  ObFTDictHub() : is_inited_(false), dict_map_(), rw_dict_lock_() {}
+  ObFTDictHub()
+      : is_inited_(false),
+        dict_map_(),
+        rw_dict_lock_(),
+        dict_version_(0),
+        shared_lock_(),
+        shared_alloc_(lib::ObMemAttr("FTDictHub")),
+        shared_set_(nullptr)
+  {
+  }
   ~ObFTDictHub() {}
 
   int init();
@@ -107,17 +137,28 @@ public:
 
   int load_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container);
 
+  // Shared immutable dictionaries: build once per dictionary version instead of
+  // once per tokenizer instance (every document / every tokenize() call).
+  int get_shared_dicts(ObIFTDict *&main_dict, ObIFTDict *&quan_dict, ObIFTDict *&stop_dict);
+
 private:
   int get_dict_info(const ObFTDictInfoKey &key, ObFTDictInfo &info);
 
   int put_dict_info(const ObFTDictInfoKey &key, const ObFTDictInfo &info);
 
+  int build_shared_dict(const ObFTDictDesc &desc,
+                        ObFTCacheRangeContainer &container,
+                        ObIFTDict *&dict);
 
 private:
   bool is_inited_;
   // holds info of dict
   hash::ObHashMap<ObFTDictInfoKey, ObFTDictInfo> dict_map_;
   ObBucketLock rw_dict_lock_;
+  uint64_t dict_version_; // bumped whenever a dictionary cache is rebuilt
+  lib::ObMutex shared_lock_;
+  ObArenaAllocator shared_alloc_;
+  ObFTSharedDictSet *shared_set_;
 };
 
 } //  namespace storage
