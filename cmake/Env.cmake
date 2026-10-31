@@ -52,6 +52,17 @@ ob_define(USE_LTO_CACHE OFF)
 # 开源模式默认支持系统租户使用向量索引
 ob_define(OB_BUILD_SYS_VEC_IDX ON)
 
+# GPU-assisted construction; queries and persistence continue through native VSAG.
+ob_define(OB_BUILD_HIPVS_HNSW OFF)
+if(OB_BUILD_HIPVS_HNSW)
+  # Env.cmake is loaded before project(), when CMAKE_SYSTEM_NAME can be unset.
+  if(NOT CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" OR
+     (CMAKE_SYSTEM_NAME AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+    message(FATAL_ERROR "OB_BUILD_HIPVS_HNSW requires Linux")
+  endif()
+  add_compile_definitions(OB_BUILD_HIPVS_HNSW)
+endif()
+
 if(WIN32)
   EXECUTE_PROCESS(COMMAND powershell -NoProfile -Command "$env:PROCESSOR_ARCHITECTURE"
     OUTPUT_VARIABLE ARCHITECTURE)
