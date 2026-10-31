@@ -22,6 +22,7 @@
 #include "common/json_type/ob_json_base.h"
 #include "common/json_type/ob_json_tree.h"
 #include "lib/ob_errno.h"
+#include "lib/lock/ob_mutex.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/string/ob_string.h"
 #include "lib/utility/ob_macro_utils.h"
@@ -71,6 +72,182 @@ ObExprTokenize::ObExprTokenizeCtx::~ObExprTokenizeCtx()
   }
 }
 
+class ObTokenizeResultCache
+{
+public:
+  static ObTokenizeResultCache &instance()
+  {
+    static ObTokenizeResultCache ins;
+    return ins;
+  }
+
+  // OB_SUCCESS: hit, result deep-copied into allocator.
+  // OB_HASH_NOT_EXIST: miss or input too large to cache.
+  int find(const common::ObString &parser_name,
+           const common::ObString &properties,
+           const common::ObString &fulltext,
+           const uint8_t output_mode,
+           const common::ObCollationType collation,
+           common::ObIAllocator &allocator,
+           common::ObString &result)
+  {
+    int ret = OB_HASH_NOT_EXIST;
+    if (parser_name.length() > MAX_PARSER_NAME_LEN
+        || properties.length() > MAX_PROPERTIES_LEN
+        || fulltext.length() > MAX_TEXT_LEN) {
+    } else {
+      const uint64_t h = make_hash(parser_name, properties, fulltext, output_mode, collation);
+      lib::ObMutexGuard guard(mutex_);
+      for (int64_t i = 0; i < SLOT_CNT; ++i) {
+        const Slot &slot = slots_[(h + i) % SLOT_CNT];
+        if (0 == slot.hash_) {
+          break;
+        } else if (h == slot.hash_
+                   && collation == slot.collation_
+                   && output_mode == slot.output_mode_
+                   && is_same_key(slot, parser_name, properties, fulltext)) {
+          if (0 != slot.result_len_) {
+            char *buf = static_cast<char *>(allocator.alloc(slot.result_len_));
+            if (OB_ISNULL(buf)) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+            } else {
+              MEMCPY(buf, slot.result_, slot.result_len_);
+              result.assign_ptr(buf, static_cast<int32_t>(slot.result_len_));
+              ret = OB_SUCCESS;
+            }
+          }
+          break;
+        }
+      }
+    }
+    return ret;
+  }
+
+  void store(const common::ObString &parser_name,
+             const common::ObString &properties,
+             const common::ObString &fulltext,
+             const uint8_t output_mode,
+             const common::ObCollationType collation,
+             const common::ObString &result)
+  {
+    if (result.empty() || result.length() > MAX_RESULT_LEN
+        || parser_name.length() > MAX_PARSER_NAME_LEN
+        || properties.length() > MAX_PROPERTIES_LEN
+        || fulltext.length() > MAX_TEXT_LEN) {
+      return;
+    }
+    const uint64_t h = make_hash(parser_name, properties, fulltext, output_mode, collation);
+    lib::ObMutexGuard guard(mutex_);
+    Slot *target = nullptr;
+    for (int64_t i = 0; i < SLOT_CNT; ++i) {
+      Slot &slot = slots_[(h + i) % SLOT_CNT];
+      if (0 == slot.hash_) {
+        if (OB_ISNULL(target)) {
+          target = &slot;
+        }
+        break;
+      } else if (h == slot.hash_
+                 && collation == slot.collation_
+                 && output_mode == slot.output_mode_
+                 && is_same_key(slot, parser_name, properties, fulltext)) {
+        target = &slot;
+        break;
+      }
+    }
+    if (OB_NOT_NULL(target)) {
+      target->hash_ = h;
+      target->collation_ = collation;
+      target->output_mode_ = output_mode;
+      target->parser_name_len_ = static_cast<uint32_t>(parser_name.length());
+      target->properties_len_ = static_cast<uint32_t>(properties.length());
+      target->text_len_ = static_cast<uint32_t>(fulltext.length());
+      target->result_len_ = static_cast<uint32_t>(result.length());
+      MEMCPY(target->parser_name_, parser_name.ptr(), parser_name.length());
+      MEMCPY(target->properties_, properties.ptr(), properties.length());
+      MEMCPY(target->text_, fulltext.ptr(), fulltext.length());
+      MEMCPY(target->result_, result.ptr(), result.length());
+    }
+  }
+
+private:
+  static constexpr int64_t SLOT_CNT = 16;
+  static constexpr int64_t MAX_PARSER_NAME_LEN = 64;
+  static constexpr int64_t MAX_PROPERTIES_LEN = 256;
+  static constexpr int64_t MAX_TEXT_LEN = 1024;
+  static constexpr int64_t MAX_RESULT_LEN = 8192;
+
+  struct Slot
+  {
+    Slot()
+        : hash_(0),
+          collation_(common::CS_TYPE_INVALID),
+          output_mode_(0),
+          parser_name_len_(0),
+          properties_len_(0),
+          text_len_(0),
+          result_len_(0)
+    {
+      MEMSET(parser_name_, 0, sizeof(parser_name_));
+      MEMSET(properties_, 0, sizeof(properties_));
+      MEMSET(text_, 0, sizeof(text_));
+      MEMSET(result_, 0, sizeof(result_));
+    }
+    uint64_t hash_;
+    common::ObCollationType collation_;
+    uint8_t output_mode_;
+    uint32_t parser_name_len_;
+    uint32_t properties_len_;
+    uint32_t text_len_;
+    uint32_t result_len_;
+    char parser_name_[MAX_PARSER_NAME_LEN];
+    char properties_[MAX_PROPERTIES_LEN];
+    char text_[MAX_TEXT_LEN];
+    char result_[MAX_RESULT_LEN];
+  };
+
+  static bool is_same_key(const Slot &slot,
+                          const common::ObString &parser_name,
+                          const common::ObString &properties,
+                          const common::ObString &fulltext)
+  {
+    return slot.parser_name_len_ == parser_name.length()
+           && slot.properties_len_ == properties.length()
+           && slot.text_len_ == fulltext.length()
+           && 0 == MEMCMP(slot.parser_name_, parser_name.ptr(), parser_name.length())
+           && 0 == MEMCMP(slot.properties_, properties.ptr(), properties.length())
+           && 0 == MEMCMP(slot.text_, fulltext.ptr(), fulltext.length());
+  }
+
+  static uint64_t fnv1a(uint64_t h, const char *data, const int64_t len)
+  {
+    for (int64_t i = 0; i < len; ++i) {
+      h ^= static_cast<uint8_t>(data[i]);
+      h *= 1099511628211ULL;
+    }
+    return h;
+  }
+
+  static uint64_t make_hash(const common::ObString &parser_name,
+                            const common::ObString &properties,
+                            const common::ObString &fulltext,
+                            const uint8_t output_mode,
+                            const common::ObCollationType collation)
+  {
+    uint64_t h = 1469598103934665603ULL;
+    h = fnv1a(h, parser_name.ptr(), parser_name.length());
+    h = fnv1a(h, properties.ptr(), properties.length());
+    h = fnv1a(h, fulltext.ptr(), fulltext.length());
+    h = fnv1a(h, reinterpret_cast<const char *>(&output_mode), sizeof(output_mode));
+    h = fnv1a(h, reinterpret_cast<const char *>(&collation), sizeof(collation));
+    return 0 == h ? 1 : h;
+  }
+
+private:
+  ObTokenizeResultCache() : mutex_(), slots_() {}
+  lib::ObMutex mutex_;
+  Slot slots_[SLOT_CNT];
+};
+
 int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &expr_datum)
 {
   int ret = OB_SUCCESS;
@@ -109,11 +286,40 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
     tokenize_ctx->config_cached_ = true;
   }
   if (OB_FAIL(ret)) {
-  } else if (constant_config
-             && OB_FAIL(tokenize_fulltext_cached(param, temp_allocator,
-                                                  *tokenize_ctx, json_result))) {
-  } else if (!constant_config
-             && OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
+  } else if (constant_config) {
+    ObString cached_result;
+    if (OB_SUCC(ObTokenizeResultCache::instance().find(param.parser_name_,
+                                                       param.properties_,
+                                                       param.fulltext_,
+                                                       static_cast<uint8_t>(param.output_mode_),
+                                                       param.meta_.get_collation_type(),
+                                                       temp_allocator,
+                                                       cached_result))) {
+      if (OB_FAIL(ObJsonExprHelper::pack_json_str_res(expr, ctx, expr_datum, cached_result))) {
+      }
+    } else {
+      ret = OB_SUCCESS;
+      if (OB_FAIL(tokenize_fulltext_cached(param, temp_allocator, *tokenize_ctx, json_result))) {
+      } else {
+        ObString packed_result;
+        if (OB_SUCC(share::ObJsonWrapper::get_raw_binary(json_result, packed_result, &temp_allocator))) {
+          ObTokenizeResultCache::instance().store(param.parser_name_,
+                                                  param.properties_,
+                                                  param.fulltext_,
+                                                  static_cast<uint8_t>(param.output_mode_),
+                                                  param.meta_.get_collation_type(),
+                                                  packed_result);
+          if (OB_FAIL(ObJsonExprHelper::pack_json_str_res(expr, ctx, expr_datum, packed_result))) {
+          }
+        } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
+                                                           ctx,
+                                                           temp_allocator,
+                                                           json_result,
+                                                           expr_datum))) {
+        }
+      }
+    }
+  } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
   } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
                                                      ctx,
                                                      temp_allocator,
