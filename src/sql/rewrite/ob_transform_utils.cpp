@@ -12858,6 +12858,74 @@ int ObTransformUtils::inner_check_need_calc_match_score(ObExecContext *exec_ctx,
   return ret;
 }
 
+static bool match_expr_contains(ObRawExpr *expr, ObRawExpr *match_expr)
+{
+  bool found = (expr == match_expr);
+  for (int64_t i = 0; !found && i < expr->get_param_count(); ++i) {
+    found = match_expr_contains(expr->get_param_expr(i), match_expr);
+  }
+  return found;
+}
+
+int ObTransformUtils::check_need_calc_match_score(ObExecContext *exec_ctx,
+                                                  const ObDMLStmt *stmt,
+                                                  ObRawExpr *match_expr,
+                                                  bool &need_calc,
+                                                  ObIArray<ObExprConstraint> &constraints)
+{
+  int ret = OB_SUCCESS;
+  need_calc = true;
+  ObSEArray<ObRawExpr *, 8> check_exprs;
+  bool has_gate = false;
+  bool conds_are_gates = true;
+  if (OB_ISNULL(exec_ctx) || OB_ISNULL(stmt) || OB_ISNULL(match_expr)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    // Elide the score only when the match expr is the whole WHERE condition.
+    // Any residual predicate or nested use needs a real score: the no-score
+    // DAS path applies no filter and would leak rows it should have dropped.
+    const ObIArray<ObRawExpr *> &conds = stmt->get_condition_exprs();
+    for (int64_t i = 0; OB_SUCC(ret) && i < conds.count(); ++i) {
+      ObRawExpr *cond = conds.at(i);
+      if (OB_ISNULL(cond)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (cond == match_expr
+                 || (T_OP_BOOL == cond->get_expr_type()
+                     && 1 == cond->get_param_count()
+                     && cond->get_param_expr(0) == match_expr)) {
+        has_gate = true;
+      } else {
+        conds_are_gates = false;
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < stmt->get_order_item_size(); ++i) {
+      if (OB_FAIL(check_exprs.push_back(stmt->get_order_item(i).expr_))) {
+      }
+    }
+    if (OB_SUCC(ret) && stmt::T_SELECT == stmt->get_stmt_type()) {
+      const ObSelectStmt *sel_stmt = static_cast<const ObSelectStmt *>(stmt);
+      for (int64_t i = 0; OB_SUCC(ret) && i < sel_stmt->get_select_item_size(); ++i) {
+        if (OB_FAIL(check_exprs.push_back(sel_stmt->get_select_item(i).expr_))) {
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(append(check_exprs, sel_stmt->get_having_exprs()))) {
+      } else if (OB_SUCC(ret) && OB_FAIL(append(check_exprs, sel_stmt->get_group_exprs()))) {
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    need_calc = !(has_gate && conds_are_gates);
+    for (int64_t i = 0; OB_SUCC(ret) && !need_calc && i < check_exprs.count(); ++i) {
+      if (match_expr_contains(check_exprs.at(i), match_expr)) {
+        need_calc = true;
+      }
+    }
+  }
+  return ret;
+}
+
 int ObTransformUtils::check_expr_eq_zero(ObExecContext *ctx,
                                          ObRawExpr *expr, 
                                          bool &eq_zero, 
