@@ -350,7 +350,9 @@ int ObDDLLocalBuilder::push_task(ObAsyncTask &task)
 
 int64_t ObDDLLocalBuilder::get_thread_cnt_() const
 {
-  return lib::is_mini_mode() ? 1 : 16;
+  // One FTS index build fans out into several independent auxiliary-table
+  // builds; a single builder thread serializes them even when cores are idle.
+  return lib::is_mini_mode() ? 4 : 16;
 }
 
 }  // end namespace share
