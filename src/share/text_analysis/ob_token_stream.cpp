@@ -18,6 +18,7 @@
 
 #include "share/text_analysis/ob_token_stream.h"
 #include "share/rc/ob_server_runtime.h"
+#include "lib/charset/ob_ctype.h"
 
 namespace oceanbase
 {
@@ -82,6 +83,13 @@ int ObTextWhitespaceTokenizer::inner_open(const ObDatum &document, const ObChars
   int ret = OB_SUCCESS;
   curr_token_ptr_ = nullptr;
   trav_pos_ = 0;
+  // ascii_delim_ mirrors found_delimiter() for bytes < 0x80, derived from the
+  // same cs_->ctype bits, so the ASCII fast path is bit-identical to the generic one.
+  const unsigned char *ctype = (nullptr != cs) ? cs->ctype : nullptr;
+  for (int c = 0; c < 0x80; ++c) {
+    const unsigned char cls = (nullptr != ctype) ? ctype[c + 1] : 0;
+    ascii_delim_[c] = (0 != (cls & (_MY_SPC | _MY_CTR | _MY_PNT))) ? 1 : 0;
+  }
   return ret;
 }
 
@@ -94,15 +102,31 @@ int ObTextWhitespaceTokenizer::get_next(ObDatum &next_token, int64_t &token_freq
     ret = OB_ITER_END;
   } else {
     const char *doc = input_doc_->ptr_;
+    const unsigned char *doc_bytes = reinterpret_cast<const unsigned char *>(doc);
     const uint32_t doc_len = get_input_buf_len();
     int64_t token_len = 0;
     // to next non-whitespace pos
-    while (OB_SUCC(ret) && found_delimiter()) {
-      const int64_t c_len = ob_mbcharlen_ptr(cs_, doc + trav_pos_, doc + doc_len);
-      trav_pos_ += c_len;
-      if (trav_pos_ >= doc_len || 0 == c_len) {// if char is invalid, just skip the rest of document
-        iter_end_ = true;
-        ret = OB_ITER_END;
+    while (OB_SUCC(ret) && trav_pos_ < doc_len) {
+      const unsigned char byte = doc_bytes[trav_pos_];
+      if (byte < 0x80) {
+        if (0 == ascii_delim_[byte]) {
+          break;
+        }
+        trav_pos_ += 1;
+        if (trav_pos_ >= doc_len) {
+          iter_end_ = true;
+          ret = OB_ITER_END;
+        }
+      } else {
+        if (!found_delimiter()) {
+          break;
+        }
+        const int64_t c_len = ob_mbcharlen_ptr(cs_, doc + trav_pos_, doc + doc_len);
+        trav_pos_ += c_len;
+        if (trav_pos_ >= doc_len || 0 == c_len) {// if char is invalid, just skip the rest of document
+          iter_end_ = true;
+          ret = OB_ITER_END;
+        }
       }
     }
 
@@ -111,16 +135,32 @@ int ObTextWhitespaceTokenizer::get_next(ObDatum &next_token, int64_t &token_freq
     }
 
     // to next whitespace pos
-    while (OB_SUCC(ret) && !found_delimiter()) {
-      const int64_t c_len = ob_mbcharlen_ptr(cs_, doc + trav_pos_, doc + doc_len);
-      trav_pos_ += c_len;
-      token_len += c_len;
-      if (trav_pos_ >= doc_len || 0 == c_len) {
-        iter_end_ = true;
-        if (0 == token_len) {
-          ret = OB_ITER_END;
+    while (OB_SUCC(ret) && trav_pos_ < doc_len) {
+      const unsigned char byte = doc_bytes[trav_pos_];
+      if (byte < 0x80) {
+        if (0 != ascii_delim_[byte]) {
+          break;
         }
-        break;
+        trav_pos_ += 1;
+        token_len += 1;
+        if (trav_pos_ >= doc_len) {
+          iter_end_ = true;
+          break;
+        }
+      } else {
+        if (found_delimiter()) {
+          break;
+        }
+        const int64_t c_len = ob_mbcharlen_ptr(cs_, doc + trav_pos_, doc + doc_len);
+        trav_pos_ += c_len;
+        token_len += c_len;
+        if (trav_pos_ >= doc_len || 0 == c_len) {
+          iter_end_ = true;
+          if (0 == token_len) {
+            ret = OB_ITER_END;
+          }
+          break;
+        }
       }
     }
 
@@ -247,6 +287,8 @@ int ObBasicEnglishNormalizer::get_next(ObDatum &next_token, int64_t &token_freq)
     norm_allocator_.reuse();
     ObDatum tmp_datum;
     bool found_alnum = false;
+    bool has_upper = false;
+    bool has_non_ascii = false;
     uint32_t norm_token_len = 0;
     const char *norm_token_ptr = nullptr;
     while (OB_SUCC(ret) && !found_alnum) {
@@ -255,33 +297,34 @@ int ObBasicEnglishNormalizer::get_next(ObDatum &next_token, int64_t &token_freq)
         if (OB_UNLIKELY(OB_ITER_END != ret)) {
         }
       } else {
-        // trim leading and trailing non-alnum characters
+        // single pass: find first/last alnum, detect uppercase and non-ascii bytes
         const char *token = tmp_datum.ptr_;
         const uint32_t raw_token_len = tmp_datum.len_;
-        uint32_t first_alnum_pos = 0;
-        uint32_t last_alnum_pos = raw_token_len - 1;
+        const unsigned char *ctype = cs_->ctype;
+        uint32_t first_alnum_pos = UINT32_MAX;
+        uint32_t last_alnum_pos = 0;
+        has_upper = false;
+        has_non_ascii = false;
         for (uint32_t i = 0; i < raw_token_len; ++i) {
-          const char *character = token + i;
-          if (ob_isalnum(cs_, *character)) {
-            first_alnum_pos = i;
-            found_alnum = true;
-            break;
-          }
-        }
-
-        for (int32_t i = raw_token_len - 1; 0 <= i && i < raw_token_len && i >= first_alnum_pos; --i) {
-          const char *character = token + i;
-          if (ob_isalnum(cs_, *character)) {
+          const unsigned char byte = static_cast<unsigned char>(token[i]);
+          const unsigned char cls = (nullptr != ctype) ? ctype[byte + 1] : 0;
+          if (0 != (cls & (_MY_U | _MY_L | _MY_NMR))) {
+            if (UINT32_MAX == first_alnum_pos) {
+              first_alnum_pos = i;
+            }
             last_alnum_pos = i;
             found_alnum = true;
-            break;
+            if (0 != (cls & _MY_U)) {
+              has_upper = true;
+            }
+          }
+          if (0x80 <= byte) {
+            has_non_ascii = true;
           }
         }
 
         if (!found_alnum) {
           // skip
-        } else if (OB_UNLIKELY(last_alnum_pos < first_alnum_pos)) {
-          ret = OB_ERR_UNEXPECTED;
         } else {
           norm_token_len = last_alnum_pos - first_alnum_pos + 1;
           norm_token_ptr = token + first_alnum_pos;
@@ -292,12 +335,27 @@ int ObBasicEnglishNormalizer::get_next(ObDatum &next_token, int64_t &token_freq)
     if (OB_FAIL(ret)) {
     } else if (OB_UNLIKELY(!found_alnum)) {
       ret = OB_ERR_UNEXPECTED;
-    } else {
+    } else if (has_non_ascii) {
       ObString norm_alnum_token(norm_token_len, norm_token_ptr);
       ObString norm_lower_token;
       if (OB_FAIL(ObCharset::tolower(cs_, norm_alnum_token, norm_lower_token, norm_allocator_))) {
       } else {
         next_token.set_string(norm_lower_token);
+      }
+    } else if (!has_upper) {
+      // no uppercase in the trimmed range: casedn() would leave every byte
+      // unchanged, so point directly into the (stable) document buffer
+      next_token.set_string(norm_token_ptr, norm_token_len);
+    } else {
+      char *buf = static_cast<char *>(norm_allocator_.alloc(norm_token_len));
+      if (OB_ISNULL(buf)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        for (uint32_t i = 0; i < norm_token_len; ++i) {
+          const char c = norm_token_ptr[i];
+          buf[i] = (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
+        }
+        next_token.set_string(buf, norm_token_len);
       }
     }
   }

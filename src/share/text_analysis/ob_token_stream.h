@@ -81,6 +81,9 @@ private:
 private:
   const char *curr_token_ptr_;
   int64_t trav_pos_;
+  // Merged ASCII delimiter classes derived from cs_->ctype at open() time.
+  // Same bits as found_delimiter() (space/control/punct), one lookup per byte.
+  uint8_t ascii_delim_[128];
 };
 
 class ObTokenNormalizer : public ObITokenStream
